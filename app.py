@@ -1,4 +1,5 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session
+import time as _time
 import requests
 import json
 import os
@@ -6,6 +7,7 @@ import webbrowser
 from threading import Timer
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'qb-secret-change-me-2024')
 
 # ── CREDENTIALS (all from environment variables) ──────────────────────────────
 CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
@@ -16,6 +18,10 @@ ZOHO_BASE     = "https://invoice.zoho.in/api/v3"
 TOKEN_FILE    = "zoho_tokens.json"
 PORT          = int(os.environ.get('PORT', 5000))
 IS_RAILWAY    = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_SERVICE_NAME'))
+
+# ── QUOTEFORM CONFIG ──────────────────────────────────────────────────────────
+QUOTEFORM_PIN       = os.environ.get('QUOTEFORM_PIN', '0000')
+QUOTEFORM_TIMEOUT   = 300  # 5 minutes inactivity in seconds
 
 # ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
 def load_tokens():
@@ -851,6 +857,561 @@ checkStatus();
 </script>
 </body>
 </html>"""
+
+# ── QUOTEFORM HELPERS ─────────────────────────────────────────────────────────
+def qf_logged_in():
+    """Check if QuoteForm session is valid and not timed out."""
+    if not session.get('qf_auth'):
+        return False
+    last = session.get('qf_last', 0)
+    if _time.time() - last > QUOTEFORM_TIMEOUT:
+        session.pop('qf_auth', None)
+        session.pop('qf_last', None)
+        return False
+    # Refresh timer on activity
+    session['qf_last'] = _time.time()
+    return True
+
+def get_all_customers():
+    """Fetch all customers from Zoho, return list of {id, name, state}."""
+    all_contacts = []
+    page = 1
+    while True:
+        r = zh_get('/contacts', {'contact_type': 'customer', 'page': page, 'per_page': 200})
+        data = r.json()
+        batch = data.get('contacts', [])
+        all_contacts.extend(batch)
+        if not data.get('page_context', {}).get('has_more_page', False):
+            break
+        page += 1
+    result = []
+    for c in all_contacts:
+        result.append({
+            'id':    c['contact_id'],
+            'name':  c['contact_name'],
+            'state': c.get('billing_address', {}).get('state', '')
+        })
+    return result
+
+def send_estimate_email(estimate_id, to_email):
+    """Send estimate PDF via Zoho's send email API."""
+    payload = {
+        "send_from_org_email_id": True,
+        "to_mail_ids": [to_email],
+        "subject": "Your Quotation",
+        "body": ""
+    }
+    r = requests.post(
+        f'{ZOHO_BASE}/estimates/{estimate_id}/email',
+        headers=zh(),
+        json=payload
+    )
+    return r.json()
+
+def get_estimate_pdf(estimate_id):
+    """Download estimate PDF bytes from Zoho."""
+    token  = get_fresh_token()
+    org_id = load_tokens().get('org_id', '')
+    headers = {
+        'Authorization': f'Zoho-oauthtoken {token}',
+        'X-com-zoho-invoice-organizationid': org_id,
+    }
+    r = requests.get(
+        f'{ZOHO_BASE}/estimates/{estimate_id}?accept=pdf',
+        headers=headers
+    )
+    if r.status_code == 200 and 'application/pdf' in r.headers.get('Content-Type', ''):
+        return r.content
+    return None
+
+# ── QUOTEFORM ROUTES ──────────────────────────────────────────────────────────
+
+QUOTEFORM_PIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Quote Form</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#4F46E5;--accent-h:#4338CA;--r:14px}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:32px 24px;width:100%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .icon{width:48px;height:48px;background:var(--accent);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 20px}
+  h1{font-size:20px;font-weight:800;color:var(--ink);text-align:center;margin-bottom:6px}
+  .sub{font-size:13px;color:var(--muted);text-align:center;margin-bottom:28px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+  input[type=password]{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:13px;font-size:18px;text-align:center;letter-spacing:.3em;outline:none;color:var(--ink);transition:border .2s;-webkit-appearance:none}
+  input[type=password]:focus{border-color:var(--accent)}
+  .btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-top:14px;-webkit-tap-highlight-color:transparent}
+  .btn:active{background:var(--accent-h)}
+  .err{background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:10px 14px;font-size:13px;color:#7F1D1D;margin-top:12px;display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">📋</div>
+  <h1>Quote Form</h1>
+  <p class="sub">Enter your PIN to continue</p>
+  {% if error %}<div class="err" style="display:block">Incorrect PIN. Try again.</div>{% endif %}
+  <form method="POST" action="/quoteform/login">
+    <label>PIN</label>
+    <input type="password" name="pin" id="pin" inputmode="numeric" autocomplete="off" autofocus maxlength="20" placeholder="••••">
+    <button type="submit" class="btn">Continue →</button>
+  </form>
+</div>
+</body>
+</html>"""
+
+QUOTEFORM_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Quote Form">
+<title>Quote Form</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#4F46E5;--accent-h:#4338CA;--green:#059669;--red:#DC2626;--r:14px}
+  html{-webkit-text-size-adjust:100%}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;padding:20px 16px 60px}
+  .shell{width:100%;max-width:560px;margin:0 auto}
+  .header{display:flex;align-items:center;gap:10px;margin-bottom:24px}
+  .brand-icon{width:38px;height:38px;background:var(--accent);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:19px;flex-shrink:0}
+  .brand-name{font-size:20px;font-weight:800;color:var(--ink);letter-spacing:-.5px}
+  .brand-sub{font-size:11px;color:var(--muted)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+  .section-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:5px}
+  .field input,.field select{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:11px 13px;font-size:14px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);background:var(--surface);transition:border .2s;-webkit-appearance:none}
+  .field input:focus,.field select:focus{border-color:var(--accent)}
+  .field input::placeholder{color:#9CA3AF}
+  /* Items table */
+  .items-header{display:grid;grid-template-columns:1fr 70px 100px 90px 36px;gap:6px;padding:0 2px;margin-bottom:6px}
+  .items-header span{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  .item-row{display:grid;grid-template-columns:1fr 70px 100px 90px 36px;gap:6px;margin-bottom:8px;align-items:center}
+  .item-row input{border:1.5px solid var(--border);border-radius:8px;padding:9px 10px;font-size:13px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);width:100%;transition:border .2s;-webkit-appearance:none}
+  .item-row input:focus{border-color:var(--accent)}
+  .item-row input[readonly]{background:#F3F4F6;color:var(--muted);cursor:default}
+  .item-row input::placeholder{color:#9CA3AF}
+  .del-btn{width:32px;height:32px;background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;color:var(--red);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent;flex-shrink:0}
+  .del-btn:active{background:#FEE2E2}
+  .add-row-btn{display:flex;align-items:center;gap:6px;background:none;border:1.5px dashed var(--border);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;width:100%;margin-top:4px;-webkit-tap-highlight-color:transparent;transition:border .2s,color .2s}
+  .add-row-btn:hover{border-color:var(--accent);color:var(--accent)}
+  /* Submit button */
+  .btn-main{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:15px;font-size:15px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  .btn-main:active:not(:disabled){background:var(--accent-h)}
+  .btn-main:disabled{background:#9CA3AF;cursor:not-allowed}
+  /* Loader */
+  .loader{display:none;text-align:center;padding:16px 0;color:var(--muted);font-size:13px}
+  .dots span{display:inline-block;width:6px;height:6px;background:var(--accent);border-radius:50%;margin:0 2px;animation:bounce .9s infinite ease-in-out}
+  .dots span:nth-child(2){animation-delay:.15s}
+  .dots span:nth-child(3){animation-delay:.3s}
+  @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
+  /* Result */
+  .result{display:none;border-radius:12px;padding:18px;margin-top:14px}
+  .result.success{background:#ECFDF5;border:1.5px solid #A7F3D0}
+  .result.error{background:#FEF2F2;border:1.5px solid #FECACA}
+  .result-title{font-weight:800;font-size:15px;margin-bottom:12px}
+  .result-row{display:flex;align-items:baseline;gap:8px;padding:3px 0;font-size:13px}
+  .rl{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;width:80px;flex-shrink:0}
+  .rv{font-weight:600;color:var(--ink)}
+  .rt{font-size:18px;font-weight:800;color:var(--green)}
+  .pdf-btns{display:flex;gap:10px;margin-top:16px}
+  .pdf-btn{flex:1;padding:12px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;border:none;text-align:center;text-decoration:none;display:flex;align-items:center;justify-content:center;gap:6px;-webkit-tap-highlight-color:transparent}
+  .pdf-view{background:#EEF2FF;color:#4F46E5;border:1.5px solid #C7D2FE}
+  .pdf-view:active{background:#E0E7FF}
+  .pdf-dl{background:var(--accent);color:#fff}
+  .pdf-dl:active{background:var(--accent-h)}
+  .err-msg{color:#7F1D1D;font-size:12px;line-height:1.6;word-break:break-word}
+  /* Timeout warning */
+  .timeout-bar{position:fixed;bottom:0;left:0;right:0;background:#1F2937;color:#fff;font-size:12px;padding:10px 16px;text-align:center;display:none;z-index:999}
+  /* Mobile tweaks */
+  @media(max-width:420px){
+    .items-header{grid-template-columns:1fr 52px 86px 76px 32px}
+    .item-row{grid-template-columns:1fr 52px 86px 76px 32px}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="header">
+    <div class="brand-icon">📋</div>
+    <div>
+      <div class="brand-name">Quote Form</div>
+      <div class="brand-sub">Create a Zoho Estimate</div>
+    </div>
+  </div>
+
+  <!-- Customer -->
+  <div class="card">
+    <div class="section-label">Customer</div>
+    <div class="field">
+      <label>Store / Customer Name</label>
+      <input type="text" id="cust-search" placeholder="Type to search..." autocomplete="off" oninput="filterCustomers()" onclick="showDropdown()">
+      <div id="cust-dropdown" style="display:none;border:1.5px solid var(--border);border-radius:10px;margin-top:4px;background:#fff;max-height:220px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.08)"></div>
+      <input type="hidden" id="cust-id">
+      <input type="hidden" id="cust-state">
+    </div>
+    <div class="field">
+      <label>Contact Email <span style="color:#9CA3AF;font-weight:400">(optional)</span></label>
+      <input type="email" id="cust-email" placeholder="email@example.com" autocomplete="off">
+    </div>
+  </div>
+
+  <!-- Items -->
+  <div class="card">
+    <div class="section-label">Items</div>
+    <div class="items-header">
+      <span>Item Name</span>
+      <span>Qty</span>
+      <span>Unit Price</span>
+      <span>Total</span>
+      <span></span>
+    </div>
+    <div id="items-container"></div>
+    <button class="add-row-btn" onclick="addRow()">
+      <span style="font-size:18px;line-height:1">+</span> Add Item
+    </button>
+  </div>
+
+  <!-- Submit -->
+  <div class="card" style="padding:16px">
+    <button class="btn-main" id="submit-btn" onclick="submitForm()">
+      <span>Generate Quote</span><span>→</span>
+    </button>
+    <div class="loader" id="loader">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <div style="margin-top:8px">Creating estimate in Zoho…</div>
+    </div>
+    <div class="result" id="result"></div>
+  </div>
+</div>
+
+<div class="timeout-bar" id="timeout-bar">⏱ Session expiring soon — submit your quote or <a href="/quoteform" style="color:#60A5FA">refresh</a></div>
+
+<script>
+// ── Customer data ──
+const customers = {{ customers_json }};
+let selectedCustomer = null;
+
+function filterCustomers(){
+  const q = document.getElementById('cust-search').value.trim().toLowerCase();
+  showDropdown(q);
+  // Clear selection if user types again
+  document.getElementById('cust-id').value = '';
+  document.getElementById('cust-state').value = '';
+  selectedCustomer = null;
+}
+
+function showDropdown(q){
+  const dd = document.getElementById('cust-dropdown');
+  const search = q !== undefined ? q : document.getElementById('cust-search').value.trim().toLowerCase();
+  const filtered = search.length === 0
+    ? customers.slice(0, 50)
+    : customers.filter(c => c.name.toLowerCase().includes(search));
+
+  if(!filtered.length){ dd.style.display='none'; return; }
+
+  dd.innerHTML = filtered.map(c =>
+    `<div onclick="selectCustomer('${c.id}','${c.name.replace(/'/g,"\\'")}','${(c.state||'').replace(/'/g,"\\'")}'')"
+      style="padding:10px 14px;cursor:pointer;font-size:14px;border-bottom:1px solid #F3F4F6;color:#111827"
+      onmouseover="this.style.background='#F9FAFB'" onmouseout="this.style.background=''">${c.name}${c.state?'<span style=\\'font-size:11px;color:#6B7280;margin-left:6px\\'>' + c.state + '</span>':''}</div>`
+  ).join('');
+  dd.style.display = 'block';
+}
+
+function selectCustomer(id, name, state){
+  document.getElementById('cust-search').value = name;
+  document.getElementById('cust-id').value = id;
+  document.getElementById('cust-state').value = state;
+  document.getElementById('cust-dropdown').style.display = 'none';
+  selectedCustomer = {id, name, state};
+}
+
+document.addEventListener('click', e => {
+  if(!e.target.closest('#cust-search') && !e.target.closest('#cust-dropdown'))
+    document.getElementById('cust-dropdown').style.display = 'none';
+});
+
+// ── Items ──
+let rowCount = 0;
+
+function addRow(){
+  rowCount++;
+  const id = rowCount;
+  const row = document.createElement('div');
+  row.className = 'item-row';
+  row.id = `row-${id}`;
+  row.innerHTML = `
+    <input type="text" placeholder="Item name" id="name-${id}">
+    <input type="number" placeholder="1" min="0" step="any" id="qty-${id}" oninput="calcTotal(${id})">
+    <input type="number" placeholder="0.00" min="0" step="any" id="unit-${id}" oninput="calcFromUnit(${id})">
+    <input type="number" placeholder="0.00" min="0" step="any" id="total-${id}" oninput="calcFromTotal(${id})">
+    <button class="del-btn" onclick="removeRow(${id})">×</button>`;
+  document.getElementById('items-container').appendChild(row);
+}
+
+function calcFromUnit(id){
+  const qty   = parseFloat(document.getElementById(`qty-${id}`).value) || 0;
+  const unit  = parseFloat(document.getElementById(`unit-${id}`).value) || 0;
+  const total = document.getElementById(`total-${id}`);
+  if(qty && unit){ total.value = (qty * unit).toFixed(2); total.setAttribute('readonly',''); }
+  else { total.removeAttribute('readonly'); total.value = ''; }
+}
+
+function calcFromTotal(id){
+  const qty   = parseFloat(document.getElementById(`qty-${id}`).value) || 0;
+  const tot   = parseFloat(document.getElementById(`total-${id}`).value) || 0;
+  const unit  = document.getElementById(`unit-${id}`);
+  if(qty && tot){ unit.value = (tot / qty).toFixed(2); unit.setAttribute('readonly',''); }
+  else { unit.removeAttribute('readonly'); unit.value = ''; }
+}
+
+function calcTotal(id){
+  // Recalculate whichever direction was active
+  const unitEl  = document.getElementById(`unit-${id}`);
+  const totalEl = document.getElementById(`total-${id}`);
+  if(!unitEl.hasAttribute('readonly')) calcFromUnit(id);
+  else calcFromTotal(id);
+}
+
+function removeRow(id){
+  const el = document.getElementById(`row-${id}`);
+  if(el) el.remove();
+}
+
+function getItems(){
+  const rows = document.querySelectorAll('.item-row');
+  const items = [];
+  rows.forEach(row => {
+    const id = row.id.replace('row-','');
+    const name  = (document.getElementById(`name-${id}`)?.value || '').trim();
+    const qty   = parseFloat(document.getElementById(`qty-${id}`)?.value) || 1;
+    const unit  = parseFloat(document.getElementById(`unit-${id}`)?.value) || 0;
+    if(name && unit > 0) items.push({name, quantity: qty, unit_price: unit});
+  });
+  return items;
+}
+
+// ── Submit ──
+async function submitForm(){
+  const custId    = document.getElementById('cust-id').value;
+  const custName  = document.getElementById('cust-search').value.trim();
+  const custState = document.getElementById('cust-state').value;
+  const email     = document.getElementById('cust-email').value.trim();
+  const items     = getItems();
+
+  if(!custId){ alert('Please select a customer from the list.'); return; }
+  if(!items.length){ alert('Please add at least one item with a name and price.'); return; }
+
+  const btn    = document.getElementById('submit-btn');
+  const loader = document.getElementById('loader');
+  const result = document.getElementById('result');
+  btn.disabled = true;
+  loader.style.display = 'block';
+  result.style.display = 'none';
+
+  try{
+    const r = await fetch('/quoteform/generate', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({customer_id: custId, customer_name: custName, customer_state: custState, email, items})
+    });
+    const d = await r.json();
+    result.style.display = 'block';
+
+    if(d.status === 'session_expired'){
+      result.className = 'result error';
+      result.innerHTML = '<div class="result-title" style="color:#7F1D1D">⏱ Session Expired</div><div class="err-msg">Your session has expired. <a href="/quoteform">Login again</a></div>';
+    } else if(d.status === 'success'){
+      result.className = 'result success';
+      result.innerHTML = `
+        <div class="result-title" style="color:#065F46">✅ Quote Created</div>
+        <div class="result-row"><span class="rl">Quote No.</span><span class="rv">${d.estimate_number}</span></div>
+        <div class="result-row"><span class="rl">Customer</span><span class="rv">${d.customer}</span></div>
+        <div class="result-row"><span class="rl">Total</span><span class="rt">₹${d.total}</span></div>
+        ${d.email_sent ? '<div class="result-row"><span class="rl">Email</span><span class="rv" style="color:#059669">✓ Sent</span></div>' : ''}
+        <div class="pdf-btns">
+          <a href="/quoteform/pdf/${d.estimate_id}?view=1" target="_blank" class="pdf-btn pdf-view">👁 View PDF</a>
+          <a href="/quoteform/pdf/${d.estimate_id}" class="pdf-btn pdf-dl">⬇ Download</a>
+        </div>`;
+    } else {
+      result.className = 'result error';
+      result.innerHTML = `<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${d.message}</div>`;
+    }
+  } catch(e){
+    result.style.display = 'block';
+    result.className = 'result error';
+    result.innerHTML = `<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${e.message}</div>`;
+  }
+  btn.disabled = false;
+  loader.style.display = 'none';
+}
+
+// ── Session timeout warning ──
+let warnTimer, expireTimer;
+function resetTimers(){
+  clearTimeout(warnTimer); clearTimeout(expireTimer);
+  document.getElementById('timeout-bar').style.display = 'none';
+  warnTimer   = setTimeout(() => { document.getElementById('timeout-bar').style.display = 'block'; }, {{ warn_ms }});
+  expireTimer = setTimeout(() => { window.location.href = '/quoteform?expired=1'; }, {{ timeout_ms }});
+}
+document.addEventListener('click',  resetTimers);
+document.addEventListener('input',  resetTimers);
+document.addEventListener('keydown', resetTimers);
+resetTimers();
+
+// Start with one empty row
+addRow();
+</script>
+</body>
+</html>"""
+
+@app.route('/quoteform')
+def quoteform_login_page():
+    from flask import redirect, url_for
+    if qf_logged_in():
+        return redirect('/quoteform/create')
+    expired = request.args.get('expired')
+    return render_template_string(QUOTEFORM_PIN_HTML, error=expired)
+
+@app.route('/quoteform/login', methods=['POST'])
+def quoteform_login():
+    from flask import redirect
+    pin = request.form.get('pin', '').strip()
+    if pin == QUOTEFORM_PIN:
+        session['qf_auth'] = True
+        session['qf_last'] = _time.time()
+        return redirect('/quoteform/create')
+    return render_template_string(QUOTEFORM_PIN_HTML, error=True)
+
+@app.route('/quoteform/create')
+def quoteform_create():
+    if not qf_logged_in():
+        from flask import redirect
+        return redirect('/quoteform')
+    customers = get_all_customers()
+    import json as _json
+    customers_json = _json.dumps(customers)
+    warn_ms    = int((QUOTEFORM_TIMEOUT - 60) * 1000)   # warn 1 min before
+    timeout_ms = int(QUOTEFORM_TIMEOUT * 1000)
+    return render_template_string(
+        QUOTEFORM_HTML,
+        customers_json=customers_json,
+        warn_ms=warn_ms,
+        timeout_ms=timeout_ms
+    )
+
+@app.route('/quoteform/generate', methods=['POST'])
+def quoteform_generate():
+    if not qf_logged_in():
+        return jsonify({'status': 'session_expired'})
+
+    data          = request.json or {}
+    customer_id   = data.get('customer_id', '').strip()
+    customer_name = data.get('customer_name', '').strip()
+    customer_state= data.get('customer_state', '').strip()
+    email         = data.get('email', '').strip()
+    items_in      = data.get('items', [])
+
+    if not customer_id or not items_in:
+        return jsonify({'status': 'error', 'message': 'Missing customer or items.'})
+
+    try:
+        # Detect inter-state GST (state ≠ Telangana)
+        TS_STATES = ['telangana', 'ts']
+        is_interstate = customer_state.lower() not in TS_STATES if customer_state else False
+
+        tax_id        = get_gst18_tax_id()
+        line_items    = []
+        new_items_log = []
+
+        for item in items_in:
+            name       = item.get('name', '').strip()
+            qty        = float(item.get('quantity', 1))
+            unit_price = float(item.get('unit_price', 0))
+            if not name or unit_price <= 0:
+                continue
+
+            # Apply 10% markup
+            marked_price = round(unit_price * 1.10, 2)
+
+            # Try to find existing Zoho item
+            existing = find_item(name)
+            if existing:
+                item_id = existing['item_id']
+            else:
+                # Create new item — use generic HSN for goods
+                created  = create_item(name, '99999999', marked_price, tax_id, is_service=False)
+                item_id  = created.get('item_id', '')
+                new_items_log.append({'name': name, 'rate': marked_price})
+
+            line_items.append({
+                "item_id":  item_id,
+                "name":     name,
+                "quantity": qty,
+                "rate":     marked_price,
+                **({"tax_id": tax_id} if tax_id else {})
+            })
+
+        if not line_items:
+            return jsonify({'status': 'error', 'message': 'No valid items found.'})
+
+        # Notes: save email in notes if provided
+        notes = f"Contact Email: {email}" if email else ''
+
+        result = create_estimate(customer_id, customer_name, line_items, notes)
+        est    = result.get('estimate')
+
+        if not est:
+            return jsonify({'status': 'error', 'message': f'Zoho error: {result}'})
+
+        estimate_id = est.get('estimate_id', '')
+
+        # Send email via Zoho if provided
+        email_sent = False
+        if email and estimate_id:
+            try:
+                send_estimate_email(estimate_id, email)
+                email_sent = True
+            except Exception:
+                pass
+
+        return jsonify({
+            'status':          'success',
+            'estimate_number': est.get('estimate_number', 'N/A'),
+            'estimate_id':     estimate_id,
+            'customer':        customer_name,
+            'total':           est.get('total', 0),
+            'email_sent':      email_sent,
+            'new_items':       new_items_log
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/quoteform/pdf/<estimate_id>')
+def quoteform_pdf(estimate_id):
+    if not qf_logged_in():
+        from flask import redirect
+        return redirect('/quoteform')
+    try:
+        pdf_bytes = get_estimate_pdf(estimate_id)
+        if not pdf_bytes:
+            return "<h3 style='font-family:sans-serif;padding:24px'>Could not fetch PDF from Zoho.</h3>", 404
+        view     = request.args.get('view') == '1'
+        disp     = 'inline' if view else 'attachment; filename="quote.pdf"'
+        from flask import Response
+        return Response(pdf_bytes, mimetype='application/pdf',
+                        headers={'Content-Disposition': disp})
+    except Exception as e:
+        return f"<h3 style='font-family:sans-serif;padding:24px'>Error: {e}</h3>", 500
 
 # ── LAUNCH ────────────────────────────────────────────────────────────────────
 def open_browser():
