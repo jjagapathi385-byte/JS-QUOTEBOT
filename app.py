@@ -582,9 +582,19 @@ def get_tokens():
 
 @app.route('/process', methods=['POST'])
 def process():
-    message = request.json.get('message', '').strip()
+    body    = request.json or {}
+    message = body.get('message', '').strip()
     if not message:
         return jsonify({'status': 'error', 'message': 'No message provided.'})
+    # Markup: accept from frontend, default 10%
+    try:
+        markup_pct = float(body.get('markup', 10))
+        if markup_pct < 0 or markup_pct > 200:
+            markup_pct = 10
+    except (TypeError, ValueError):
+        markup_pct = 10
+    markup_factor = 1 + markup_pct / 100
+
     try:
         parsed        = parse_with_gemini(message)
         customer_name = parsed.get('customer_name', '').strip()
@@ -608,7 +618,7 @@ def process():
             # Support both old (hsn_code) and new (hsn_or_sac) field names
             hsn          = item.get('hsn_or_sac', item.get('hsn_code', ''))
             is_service   = item.get('is_service', False)
-            marked_price = round(unit_price * 1.10, 2)
+            marked_price = round(unit_price * markup_factor, 2)
             existing = find_item(name)
             if existing:
                 item_id = existing['item_id']
@@ -708,6 +718,9 @@ HTML = """<!DOCTYPE html>
   .warn-msg{color:#92400E;font-size:13px;line-height:1.6}
   .err-msg{color:#7F1D1D;font-size:12px;font-family:'JetBrains Mono',monospace;line-height:1.5;word-break:break-all}
   .alert-box{background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:14px;font-size:13px;color:#7F1D1D;line-height:1.6;margin-bottom:12px;display:none}
+  .markup-btn{border:1.5px solid var(--border);background:var(--surface);border-radius:8px;padding:7px 16px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;-webkit-tap-highlight-color:transparent;transition:all .15s}
+  .markup-btn:active{background:#F3F4F6}
+  .markup-active{border-color:var(--accent)!important;background:#EEF2FF!important;color:var(--accent)!important}
 </style>
 </head>
 <body>
@@ -764,7 +777,22 @@ AMR store quotation
 2.3mm tape s 2 no 600
 3.fevi bond -3no 250
 Total = 4000"></textarea>
-    <button class="btn-main" id="btn" onclick="processMessage()">
+    <div style="margin-top:12px">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Markup</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap" id="markup-btns">
+        <button class="markup-btn" data-val="5" onclick="setMarkup(this)">5%</button>
+        <button class="markup-btn" data-val="6" onclick="setMarkup(this)">6%</button>
+        <button class="markup-btn markup-active" data-val="10" onclick="setMarkup(this)">10%</button>
+        <button class="markup-btn" data-val="custom" onclick="setMarkup(this)">Custom</button>
+      </div>
+      <div id="custom-markup-wrap" style="display:none;margin-top:8px">
+        <input type="number" id="custom-markup" placeholder="Enter %" min="0" max="200" step="0.1"
+          style="width:120px;border:1.5px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);-webkit-appearance:none"
+          oninput="this.style.borderColor=this.value?'var(--accent)':'var(--border)'">
+        <span style="font-size:13px;color:var(--muted);margin-left:6px">%</span>
+      </div>
+    </div>
+    <button class="btn-main" id="btn" onclick="processMessage()" style="margin-top:14px">
       <span>Create Quotation in Zoho</span><span>→</span>
     </button>
     <div class="loader" id="loader">
@@ -819,13 +847,30 @@ function copyVal(id){
     document.body.removeChild(ta);alert('Copied!');
   });
 }
+let _activeMarkup=10;
+function setMarkup(el){
+  document.querySelectorAll('.markup-btn').forEach(b=>b.classList.remove('markup-active'));
+  el.classList.add('markup-active');
+  const val=el.dataset.val;
+  document.getElementById('custom-markup-wrap').style.display=(val==='custom'?'block':'none');
+  if(val!=='custom') _activeMarkup=parseFloat(val);
+}
+function getMarkup(){
+  const active=document.querySelector('.markup-active');
+  if(active&&active.dataset.val==='custom'){
+    const v=parseFloat(document.getElementById('custom-markup').value);
+    return isNaN(v)?10:v;
+  }
+  return _activeMarkup;
+}
 async function processMessage(){
   const msg=document.getElementById('msg').value.trim();
   if(!msg){alert('Paste a WhatsApp message first.');return}
+  const markup=getMarkup();
   const btn=document.getElementById('btn'),loader=document.getElementById('loader'),res=document.getElementById('result');
   btn.disabled=true;loader.style.display='block';res.style.display='none';
   try{
-    const r=await fetch('/process',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    const r=await fetch('/process',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,markup})});
     const d=await r.json();
     res.style.display='block';
     if(d.status==='success'){
@@ -1118,11 +1163,17 @@ function showDropdown(q){
 
   if(!filtered.length){ dd.style.display='none'; return; }
 
-  dd.innerHTML = filtered.map(c =>
-    `<div onclick="selectCustomer('${c.id}','${c.name.replace(/'/g,"\\'")}','${(c.state||'').replace(/'/g,"\\'")}'')"
-      style="padding:10px 14px;cursor:pointer;font-size:14px;border-bottom:1px solid #F3F4F6;color:#111827"
-      onmouseover="this.style.background='#F9FAFB'" onmouseout="this.style.background=''">${c.name}${c.state?'<span style=\\'font-size:11px;color:#6B7280;margin-left:6px\\'>' + c.state + '</span>':''}</div>`
-  ).join('');
+  // Store data on elements to avoid quote-escaping issues in onclick
+  dd.innerHTML = '';
+  filtered.forEach((c, i) => {
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:10px 14px;cursor:pointer;font-size:14px;border-bottom:1px solid #F3F4F6;color:#111827';
+    div.innerHTML = c.name + (c.state ? `<span style="font-size:11px;color:#6B7280;margin-left:6px">${c.state}</span>` : '');
+    div.addEventListener('mouseenter', () => div.style.background = '#F9FAFB');
+    div.addEventListener('mouseleave', () => div.style.background = '');
+    div.addEventListener('click', () => selectCustomer(c.id, c.name, c.state || ''));
+    dd.appendChild(div);
+  });
   dd.style.display = 'block';
 }
 
