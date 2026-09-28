@@ -265,15 +265,24 @@ def find_customer(name):
     names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(all_contacts)]
     names_str  = "\n".join(names_list)
 
-    prompt = f"""You are matching a WhatsApp store name to a Zoho customer list.
+    prompt = f"""You are matching a store name to a Zoho customer list for an Indian facility management business.
 
-WhatsApp name: "{name}"
+Input store name: "{name}"
 
 Zoho customers:
 {names_str}
 
-Find the best matching customer number. Consider abbreviations, partial matches, location names.
-Reply with ONLY the number (e.g. "5") or "0" if no good match exists."""
+MATCHING RULES — follow strictly:
+1. BRAND NAME is the most important factor. If the input mentions a brand (KFC, Pizza Hut, PHD, Paradise, Dominos, etc.), you MUST only consider customers with that same brand. Never match across brands.
+   - "pizza hut" or "phd" → only match PHD/Pizza Hut customers, never KFC or Paradise
+   - "kfc" → only match KFC customers, never PHD or Paradise
+   - "paradise" → only match Paradise customers, never KFC or PHD
+2. After filtering by brand, pick the customer whose LOCATION best matches the location in the input name.
+3. Customer names follow patterns like "kfc-gudimalkapur", "phd-malakpet", "paradise-kondapur" — brand prefix then location.
+4. If no brand is mentioned in the input, match purely by location across all customers.
+5. If no good match exists at all, reply with "0".
+
+Reply with ONLY the number (e.g. "5") or "0" if no good match exists. Nothing else."""
 
     r2 = requests.post(
         'https://api.groq.com/openai/v1/chat/completions',
@@ -282,8 +291,7 @@ Reply with ONLY the number (e.g. "5") or "0" if no good match exists."""
             'model': 'openai/gpt-oss-120b',
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0
-        }
-    ,
+        },
         timeout=30
     )
     try:
@@ -939,7 +947,13 @@ def get_all_customers():
     return result
 
 def send_estimate_email(estimate_id, to_email):
-    """Send estimate PDF via Zoho's send email API."""
+    """Mark estimate as sent, then send PDF via Zoho email API."""
+    # Zoho requires estimate to be marked as sent before emailing
+    requests.post(
+        f'{ZOHO_BASE}/estimates/{estimate_id}/status/sent',
+        headers=zh(),
+        json={}
+    )
     payload = {
         "send_from_org_email_id": True,
         "to_mail_ids": [to_email],
@@ -1123,6 +1137,15 @@ QUOTEFORM_HTML = """<!DOCTYPE html>
     <button type="button" class="add-row-btn" onclick="addRow()">
       <span style="font-size:18px;line-height:1">+</span> Add Item
     </button>
+    <div style="margin-top:14px">
+      <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Or paste a list directly</div>
+      <textarea id="bulk-paste" rows="4" placeholder="Example:
+LED Lights - 10nos - 200
+Paint Roller - 5 - 150
+PVC Pipe - 20nos - 80" style="width:100%;border:1.5px solid var(--border);border-radius:10px;padding:11px 13px;font-size:13px;font-family:'Inter',sans-serif;line-height:1.6;resize:vertical;outline:none;color:var(--ink);-webkit-appearance:none;transition:border .2s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"></textarea>
+      <button type="button" onclick="parseBulk()" style="margin-top:8px;background:#EEF2FF;color:var(--accent);border:1.5px solid #C7D2FE;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:700;cursor:pointer;-webkit-tap-highlight-color:transparent" id="bulk-btn">Parse &amp; Add Items</button>
+      <div id="bulk-status" style="font-size:12px;margin-top:6px;display:none"></div>
+    </div>
   </div>
 
   <!-- Submit -->
@@ -1237,6 +1260,51 @@ function calcTotal(id){
 function removeRow(id){
   const el = document.getElementById(`row-${id}`);
   if(el) el.remove();
+}
+
+async function parseBulk(){
+  const text = document.getElementById('bulk-paste').value.trim();
+  if(!text){ alert('Paste some items first.'); return; }
+  const btn    = document.getElementById('bulk-btn');
+  const status = document.getElementById('bulk-status');
+  btn.disabled = true;
+  btn.textContent = 'Parsing…';
+  status.style.display = 'none';
+  try{
+    const r = await fetch('/quoteform/parse-items', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if(d.status === 'session_expired'){
+      status.style.cssText = 'display:block;color:#DC2626';
+      status.textContent = 'Session expired. Please login again.';
+    } else if(d.status === 'success' && d.items.length){
+      d.items.forEach(item => {
+        addRow();
+        const id = rowCount;
+        document.getElementById(`name-${id}`).value  = item.name || '';
+        document.getElementById(`qty-${id}`).value   = item.quantity || 1;
+        document.getElementById(`unit-${id}`).value  = item.unit_price || '';
+        if(item.quantity && item.unit_price){
+          document.getElementById(`total-${id}`).value = (item.quantity * item.unit_price).toFixed(2);
+          document.getElementById(`total-${id}`).setAttribute('readonly','');
+        }
+      });
+      document.getElementById('bulk-paste').value = '';
+      status.style.cssText = 'display:block;color:#059669';
+      status.textContent = `✓ ${d.items.length} item${d.items.length>1?'s':''} added`;
+    } else {
+      status.style.cssText = 'display:block;color:#DC2626';
+      status.textContent = d.message || 'Could not parse items. Check format and try again.';
+    }
+  } catch(e){
+    status.style.cssText = 'display:block;color:#DC2626';
+    status.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Parse & Add Items';
 }
 
 function getItems(){
@@ -1444,6 +1512,60 @@ def quoteform_generate():
             'new_items':       new_items_log
         })
 
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/quoteform/parse-items', methods=['POST'])
+def quoteform_parse_items():
+    if not qf_logged_in():
+        return jsonify({'status': 'session_expired'})
+    text = (request.json or {}).get('text', '').strip()
+    if not text:
+        return jsonify({'status': 'error', 'message': 'No text provided.'})
+    try:
+        prompt = f"""Parse this item list and return ONLY a valid JSON array. No markdown, no explanation.
+
+Input:
+{text}
+
+Rules:
+1. Each line is one item. Extract: name, quantity (default 1), unit_price.
+2. Separators can be dash (-), comma (,), slash (/), or spaces. Be flexible.
+3. "10nos", "10 nos", "10 no", "10pcs", "qty 10" all mean quantity = 10.
+4. If total price is given for multiple qty, divide to get unit_price.
+5. Fix typos and abbreviations in item names (proper English).
+6. Ignore any lines that are clearly not items (headers, totals, blank lines).
+
+Return ONLY this JSON array:
+[
+  {{"name": "Item Name", "quantity": 1, "unit_price": 0.0}},
+  ...
+]
+
+ONLY return the JSON array. Nothing else."""
+
+        r = requests.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
+            json={
+                'model': 'openai/gpt-oss-120b',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.1,
+                'max_tokens': 1000
+            },
+            timeout=30
+        )
+        d = r.json()
+        raw = d['choices'][0]['message']['content'].strip()
+        if '```' in raw:
+            parts = raw.split('```')
+            raw = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith('json'): raw = raw[4:]
+            raw = raw.strip()
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            raise ValueError('Expected a list')
+        return jsonify({'status': 'success', 'items': items})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
