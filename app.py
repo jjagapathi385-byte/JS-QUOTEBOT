@@ -1098,7 +1098,7 @@ QUOTEFORM_HTML = """<!DOCTYPE html>
     <div class="section-label">Customer</div>
     <div class="field">
       <label>Store / Customer Name</label>
-      <input type="text" id="cust-search" placeholder="Type to search..." autocomplete="off" oninput="filterCustomers()" onclick="showDropdown()">
+      <input type="text" id="cust-search" placeholder="Type to search..." autocomplete="off" oninput="filterCustomers()" onfocus="showDropdown('')">
       <div id="cust-dropdown" style="display:none;border:1.5px solid var(--border);border-radius:10px;margin-top:4px;background:#fff;max-height:220px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.08)"></div>
       <input type="hidden" id="cust-id">
       <input type="hidden" id="cust-state">
@@ -1120,14 +1120,14 @@ QUOTEFORM_HTML = """<!DOCTYPE html>
       <span></span>
     </div>
     <div id="items-container"></div>
-    <button class="add-row-btn" onclick="addRow()">
+    <button type="button" class="add-row-btn" onclick="addRow()">
       <span style="font-size:18px;line-height:1">+</span> Add Item
     </button>
   </div>
 
   <!-- Submit -->
   <div class="card" style="padding:16px">
-    <button class="btn-main" id="submit-btn" onclick="submitForm()">
+    <button type="button" class="btn-main" id="submit-btn" onclick="submitForm()">
       <span>Generate Quote</span><span>→</span>
     </button>
     <div class="loader" id="loader">
@@ -1142,7 +1142,7 @@ QUOTEFORM_HTML = """<!DOCTYPE html>
 
 <script>
 // ── Customer data ──
-const customers = {{ customers_json }};
+const customers = {{ customers_list | tojson }};
 let selectedCustomer = null;
 
 function filterCustomers(){
@@ -1156,7 +1156,7 @@ function filterCustomers(){
 
 function showDropdown(q){
   const dd = document.getElementById('cust-dropdown');
-  const search = q !== undefined ? q : document.getElementById('cust-search').value.trim().toLowerCase();
+  const search = (q !== undefined && q !== null) ? q : document.getElementById('cust-search').value.trim().toLowerCase();
   const filtered = search.length === 0
     ? customers.slice(0, 50)
     : customers.filter(c => c.name.toLowerCase().includes(search));
@@ -1186,8 +1186,10 @@ function selectCustomer(id, name, state){
 }
 
 document.addEventListener('click', e => {
-  if(!e.target.closest('#cust-search') && !e.target.closest('#cust-dropdown'))
-    document.getElementById('cust-dropdown').style.display = 'none';
+  const search = document.getElementById('cust-search');
+  const dd = document.getElementById('cust-dropdown');
+  if(search && dd && !search.contains(e.target) && !dd.contains(e.target))
+    dd.style.display = 'none';
 });
 
 // ── Items ──
@@ -1204,7 +1206,7 @@ function addRow(){
     <input type="number" placeholder="1" min="0" step="any" id="qty-${id}" oninput="calcTotal(${id})">
     <input type="number" placeholder="0.00" min="0" step="any" id="unit-${id}" oninput="calcFromUnit(${id})">
     <input type="number" placeholder="0.00" min="0" step="any" id="total-${id}" oninput="calcFromTotal(${id})">
-    <button class="del-btn" onclick="removeRow(${id})">×</button>`;
+    <button type="button" class="del-btn" onclick="removeRow(${id})">×</button>`;
   document.getElementById('items-container').appendChild(row);
 }
 
@@ -1348,13 +1350,11 @@ def quoteform_create():
         from flask import redirect
         return redirect('/quoteform')
     customers = get_all_customers()
-    import json as _json
-    customers_json = _json.dumps(customers)
-    warn_ms    = int((QUOTEFORM_TIMEOUT - 60) * 1000)   # warn 1 min before
+    warn_ms    = int((QUOTEFORM_TIMEOUT - 60) * 1000)
     timeout_ms = int(QUOTEFORM_TIMEOUT * 1000)
     return render_template_string(
         QUOTEFORM_HTML,
-        customers_json=customers_json,
+        customers_list=customers,
         warn_ms=warn_ms,
         timeout_ms=timeout_ms
     )
