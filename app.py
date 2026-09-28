@@ -1291,8 +1291,8 @@ async function submitForm(){
         <div class="result-row"><span class="rl">Total</span><span class="rt">₹${d.total}</span></div>
         ${d.email_sent ? '<div class="result-row"><span class="rl">Email</span><span class="rv" style="color:#059669">✓ Sent</span></div>' : ''}
         <div class="pdf-btns">
-          <a href="/quoteform/pdf/${d.estimate_id}?view=1" target="_blank" class="pdf-btn pdf-view">👁 View PDF</a>
-          <a href="/quoteform/pdf/${d.estimate_id}" class="pdf-btn pdf-dl">⬇ Download</a>
+          <a href="/quoteform/pdf/${d.estimate_id}?view=1&name=${encodeURIComponent(d.estimate_number)}" target="_blank" class="pdf-btn pdf-view">👁 View PDF</a>
+          <a href="/quoteform/pdf/${d.estimate_id}?name=${encodeURIComponent(d.estimate_number)}" class="pdf-btn pdf-dl">⬇ Download</a>
         </div>`;
     } else {
       result.className = 'result error';
@@ -1456,8 +1456,13 @@ def quoteform_pdf(estimate_id):
         pdf_bytes = get_estimate_pdf(estimate_id)
         if not pdf_bytes:
             return "<h3 style='font-family:sans-serif;padding:24px'>Could not fetch PDF from Zoho.</h3>", 404
-        view     = request.args.get('view') == '1'
-        disp     = 'inline' if view else 'attachment; filename="quote.pdf"'
+        view      = request.args.get('view') == '1'
+        raw_name  = request.args.get('name', 'quote').strip() or 'quote'
+        # Sanitize filename — keep alphanumeric, dash, underscore only
+        import re
+        safe_name = re.sub(r'[^A-Za-z0-9\-_]', '-', raw_name)
+        filename  = f"{safe_name}.pdf"
+        disp      = f'inline; filename="{filename}"' if view else f'attachment; filename="{filename}"'
         from flask import Response
         return Response(pdf_bytes, mimetype='application/pdf',
                         headers={'Content-Disposition': disp})
