@@ -22,6 +22,7 @@ IS_RAILWAY    = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RA
 # ── QUOTEFORM CONFIG ──────────────────────────────────────────────────────────
 QUOTEFORM_PIN       = os.environ.get('QUOTEFORM_PIN', '0000')
 QUOTEFORM_TIMEOUT   = 300  # 5 minutes inactivity in seconds
+QUOTEFORM_ENABLED   = os.environ.get('QUOTEFORM_ENABLED', 'true').strip().lower() == 'true'
 
 # ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
 def load_tokens():
@@ -245,8 +246,38 @@ def get_gst18_tax_id():
             return tax['tax_id']
     return None
 
+def get_customer_state(customer):
+    """Extract state from Place of Supply field — more reliable than billing address."""
+    # Try place_of_supply first (e.g. "36-Telangana" or "Telangana")
+    pos = customer.get('place_of_supply', '') or ''
+    if pos:
+        # Strip state code prefix like "36-"
+        if '-' in pos:
+            pos = pos.split('-', 1)[1]
+        return pos.strip()
+    # Fallback to billing address state
+    return customer.get('billing_address', {}).get('state', '')
+
+# Brand prefix → brand name mapping
+BRAND_PREFIXES = {
+    'K': 'KFC', 'Y': 'KFC',
+    'P': 'PHD', 'Z': 'PHD',
+    'C': 'COSTA',
+    'V': 'VAANGO',
+}
+
+def extract_store_code(text):
+    """Extract store code like K589, Y044, Z091, P287, C499 from text."""
+    import re
+    # Match a letter prefix followed by 3+ digits (case-insensitive)
+    match = re.search(r'\b([KYPZCVkypcvz])(\d{3,4})\b', text)
+    if match:
+        return (match.group(1).upper() + match.group(2)).upper()
+    return None
+
 def find_customer(name):
-    # Fetch all customers and use AI to find best match
+    """Find customer — store code match first, then brand+location AI match."""
+    # Fetch all customers
     all_contacts = []
     page = 1
     while True:
@@ -261,28 +292,72 @@ def find_customer(name):
     if not all_contacts:
         return None
 
-    # Build name list for AI matching
-    names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(all_contacts)]
+    # ── Step 1: Store code direct match (no AI needed) ───────────────────────
+    store_code = extract_store_code(name)
+    if store_code:
+        for c in all_contacts:
+            cname = c.get('contact_name', '').upper()
+            # Store code is always the last segment after final dash e.g. KFC-GUDIMALKAPUR-HYD-K589
+            if cname.endswith(f'-{store_code}') or f'-{store_code}-' in cname or cname == store_code:
+                return c
+        # If code found in input but no exact match, warn but continue to AI
+        # (handles typos in code)
+
+    # ── Step 2: Brand filter + AI location match ──────────────────────────────
+    name_upper = name.upper()
+
+    # Detect brand from input text
+    brand = None
+    if any(b in name_upper for b in ['KFC']):
+        brand = 'KFC'
+    elif any(b in name_upper for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
+        brand = 'PHD'
+    elif 'COSTA' in name_upper:
+        brand = 'COSTA'
+    elif 'VAANGO' in name_upper:
+        brand = 'VAANGO'
+
+    # Also detect brand from store code prefix if present
+    if not brand and store_code:
+        prefix = store_code[0]
+        brand_from_code = BRAND_PREFIXES.get(prefix)
+        if brand_from_code:
+            brand = brand_from_code
+
+    # Filter customer list by brand if detected
+    if brand:
+        if brand == 'KFC':
+            filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
+        elif brand == 'PHD':
+            filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
+        elif brand == 'COSTA':
+            filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
+        elif brand == 'VAANGO':
+            filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
+        else:
+            filtered = all_contacts
+    else:
+        filtered = all_contacts
+
+    if not filtered:
+        filtered = all_contacts  # fallback to all if brand filter gives nothing
+
+    # Build numbered list for AI
+    names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(filtered)]
     names_str  = "\n".join(names_list)
 
-    prompt = f"""You are matching a store name to a Zoho customer list for an Indian facility management business.
+    prompt = f"""Match this store name to the correct customer from the list below.
 
-Input store name: "{name}"
+Input: "{name}"
 
-Zoho customers:
+Customers:
 {names_str}
 
-MATCHING RULES — follow strictly:
-1. BRAND NAME is the most important factor. If the input mentions a brand (KFC, Pizza Hut, PHD, Paradise, Dominos, etc.), you MUST only consider customers with that same brand. Never match across brands.
-   - "pizza hut" or "phd" → only match PHD/Pizza Hut customers, never KFC or Paradise
-   - "kfc" → only match KFC customers, never PHD or Paradise
-   - "paradise" → only match Paradise customers, never KFC or PHD
-2. After filtering by brand, pick the customer whose LOCATION best matches the location in the input name.
-3. Customer names follow patterns like "kfc-gudimalkapur", "phd-malakpet", "paradise-kondapur" — brand prefix then location.
-4. If no brand is mentioned in the input, match purely by location across all customers.
-5. If no good match exists at all, reply with "0".
-
-Reply with ONLY the number (e.g. "5") or "0" if no good match exists. Nothing else."""
+Rules:
+1. Match by LOCATION — find the customer whose location words best match the input.
+2. All customers in this list are already the correct brand — just find the right location.
+3. Store codes like K589, Y044 are at the end of the customer name — if the input has a code, match it exactly.
+4. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
 
     r2 = requests.post(
         'https://api.groq.com/openai/v1/chat/completions',
@@ -304,8 +379,8 @@ Reply with ONLY the number (e.g. "5") or "0" if no good match exists. Nothing el
 
     try:
         idx = int(''.join(filter(str.isdigit, result))) - 1
-        if 0 <= idx < len(all_contacts):
-            return all_contacts[idx]
+        if 0 <= idx < len(filtered):
+            return filtered[idx]
     except Exception:
         pass
     return None
@@ -616,6 +691,10 @@ def process():
                 'parsed_name': customer_name,
                 'message': f"Customer '{customer_name}' not found in Zoho Invoice. Please add them first."
             })
+        # Detect inter-state GST using Place of Supply
+        TS_STATES = ['telangana', 'ts', '36-telangana']
+        cust_state = get_customer_state(customer).lower()
+        is_interstate = cust_state not in TS_STATES if cust_state else False
         tax_id        = get_gst18_tax_id()
         line_items    = []
         new_items_log = []
@@ -939,10 +1018,18 @@ def get_all_customers():
         page += 1
     result = []
     for c in all_contacts:
+        # Use Place of Supply for state — more reliable than billing address
+        pos = c.get('place_of_supply', '') or ''
+        if pos and '-' in pos:
+            state = pos.split('-', 1)[1].strip()
+        elif pos:
+            state = pos.strip()
+        else:
+            state = c.get('billing_address', {}).get('state', '')
         result.append({
             'id':    c['contact_id'],
             'name':  c['contact_name'],
-            'state': c.get('billing_address', {}).get('state', '')
+            'state': state
         })
     return result
 
@@ -984,6 +1071,30 @@ def get_estimate_pdf(estimate_id):
     return None
 
 # ── QUOTEFORM ROUTES ──────────────────────────────────────────────────────────
+
+QUOTEFORM_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quote Form</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Inter',system-ui,sans-serif;background:#F7F8FC;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:#fff;border:1px solid #E4E7EF;border-radius:14px;padding:40px 28px;width:100%;max-width:360px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .icon{font-size:40px;margin-bottom:16px}
+  h1{font-size:20px;font-weight:800;color:#111827;margin-bottom:8px}
+  p{font-size:14px;color:#6B7280;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🔒</div>
+  <h1>Quote Form Unavailable</h1>
+  <p>The Quote Form is currently disabled.<br>Please contact your manager for assistance.</p>
+</div>
+</body>
+</html>"""
 
 QUOTEFORM_PIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1396,7 +1507,9 @@ addRow();
 
 @app.route('/quoteform')
 def quoteform_login_page():
-    from flask import redirect, url_for
+    from flask import redirect
+    if not QUOTEFORM_ENABLED:
+        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
     if qf_logged_in():
         return redirect('/quoteform/create')
     expired = request.args.get('expired')
@@ -1405,6 +1518,8 @@ def quoteform_login_page():
 @app.route('/quoteform/login', methods=['POST'])
 def quoteform_login():
     from flask import redirect
+    if not QUOTEFORM_ENABLED:
+        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
     pin = request.form.get('pin', '').strip()
     if pin == QUOTEFORM_PIN:
         session['qf_auth'] = True
@@ -1414,8 +1529,10 @@ def quoteform_login():
 
 @app.route('/quoteform/create')
 def quoteform_create():
+    from flask import redirect
+    if not QUOTEFORM_ENABLED:
+        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
     if not qf_logged_in():
-        from flask import redirect
         return redirect('/quoteform')
     customers = get_all_customers()
     warn_ms    = int((QUOTEFORM_TIMEOUT - 60) * 1000)
@@ -1443,9 +1560,13 @@ def quoteform_generate():
         return jsonify({'status': 'error', 'message': 'Missing customer or items.'})
 
     try:
-        # Detect inter-state GST (state ≠ Telangana)
-        TS_STATES = ['telangana', 'ts']
-        is_interstate = customer_state.lower() not in TS_STATES if customer_state else False
+        # Detect inter-state GST — handle "36-Telangana" or "Telangana" formats
+        TS_STATES = ['telangana', 'ts', '36-telangana']
+        state_check = customer_state.lower().strip()
+        # Strip numeric prefix if present (e.g. "36-telangana" → "telangana")
+        if '-' in state_check:
+            state_check = state_check.split('-', 1)[1].strip()
+        is_interstate = state_check not in ['telangana', 'ts'] if state_check else False
 
         tax_id        = get_gst18_tax_id()
         line_items    = []
