@@ -475,7 +475,79 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
         raise Exception(f"Item creation failed: {resp}")
     return item
 
-# In-memory cache for last used seq number — prevents back-to-back conflicts
+def detect_hsn_for_items(items):
+    """
+    Single Groq call to detect HSN/SAC code and goods/service flag for all items.
+    items: list of name strings
+    Returns: list of {name, hsn_or_sac, is_service}
+    """
+    if not items:
+        return []
+
+    items_numbered = "\n".join([f"{i+1}. {name}" for i, name in enumerate(items)])
+
+    prompt = f"""You are an Indian GST expert. For each item below, provide the correct HSN code (for goods) or SAC code (for services) and whether it is a good or service.
+
+Items:
+{items_numbered}
+
+Rules:
+1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
+2. Common examples:
+   - LED Lights / Lighting fixtures → HSN 94054090, goods
+   - Paint, primers → HSN 32089090, goods
+   - Electrical cables/wires → HSN 85444290, goods
+   - PVC pipes/fittings → HSN 39172390, goods
+   - Cleaning materials/chemicals → HSN 34029090, goods
+   - Tools (hammers, drills etc.) → HSN 82051000, goods
+   - Tape, adhesives → HSN 35069900, goods
+   - Safety equipment (gloves, helmets) → HSN 39262090, goods
+   - Cleaning service / housekeeping → SAC 998531, service
+   - Maintenance / repair service → SAC 995469, service
+   - Labour charges → SAC 995511, service
+   - Security service → SAC 998523, service
+3. If unsure, use HSN 99999999 for goods or SAC 999999 for services.
+
+Reply ONLY with a JSON array, no markdown, no explanation:
+[
+  {{"item": 1, "hsn_or_sac": "94054090", "is_service": false}},
+  ...
+]"""
+
+    try:
+        r = requests.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
+            json={
+                'model': 'openai/gpt-oss-120b',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0,
+                'max_tokens': 500
+            },
+            timeout=30
+        )
+        d    = r.json()
+        raw  = d['choices'][0]['message']['content'].strip()
+        if '```' in raw:
+            parts = raw.split('```')
+            raw   = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith('json'): raw = raw[4:]
+            raw = raw.strip()
+        parsed = json.loads(raw)
+        # Build result list indexed by item number
+        result = {}
+        for entry in parsed:
+            idx = entry.get('item', 0) - 1
+            result[idx] = {
+                'hsn_or_sac': str(entry.get('hsn_or_sac', '99999999')),
+                'is_service':  bool(entry.get('is_service', False))
+            }
+        return result
+    except Exception:
+        # On any failure return empty dict — caller will use fallback
+        return {}
+
+
 _last_seq = {'value': 0}
 
 def get_default_notes():
@@ -1572,7 +1644,11 @@ def quoteform_generate():
         line_items    = []
         new_items_log = []
 
-        for item in items_in:
+        # Detect HSN/SAC for all items in one Groq call
+        item_names  = [item.get('name', '').strip() for item in items_in if item.get('name', '').strip()]
+        hsn_map     = detect_hsn_for_items(item_names)
+
+        for idx, item in enumerate(items_in):
             name       = item.get('name', '').strip()
             qty        = float(item.get('quantity', 1))
             unit_price = float(item.get('unit_price', 0))
@@ -1582,15 +1658,21 @@ def quoteform_generate():
             # Apply 10% markup
             marked_price = round(unit_price * 1.10, 2)
 
+            # Get HSN/SAC from detection result, fallback to generic
+            hsn_info   = hsn_map.get(idx, {})
+            hsn_code   = hsn_info.get('hsn_or_sac', '99999999')
+            is_service = hsn_info.get('is_service', False)
+
             # Try to find existing Zoho item
             existing = find_item(name)
             if existing:
                 item_id = existing['item_id']
             else:
-                # Create new item — use generic HSN for goods
-                created  = create_item(name, '99999999', marked_price, tax_id, is_service=False)
+                # Create new item with correct HSN/SAC
+                created  = create_item(name, hsn_code, marked_price, tax_id, is_service=is_service)
                 item_id  = created.get('item_id', '')
-                new_items_log.append({'name': name, 'rate': marked_price})
+                label    = 'SAC' if is_service else 'HSN'
+                new_items_log.append({'name': name, 'hsn': f"{label}: {hsn_code}", 'rate': marked_price})
 
             line_items.append({
                 "item_id":  item_id,
