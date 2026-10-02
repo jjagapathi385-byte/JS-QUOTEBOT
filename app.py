@@ -24,6 +24,10 @@ QUOTEFORM_PIN       = os.environ.get('QUOTEFORM_PIN', '0000')
 QUOTEFORM_TIMEOUT   = 300  # 5 minutes inactivity in seconds
 QUOTEFORM_ENABLED   = os.environ.get('QUOTEFORM_ENABLED', 'true').strip().lower() == 'true'
 
+# ── TELEGRAM CONFIG ───────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID    = os.environ.get('TELEGRAM_CHAT_ID', '')
+
 # ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
 def load_tokens():
     env_refresh = os.environ.get('ZOHO_REFRESH_TOKEN', '')
@@ -139,6 +143,9 @@ Rules:
    Paint=32089090, Cement=25232900, Steel/iron=72142000, Screws/bolts=73181500,
    Plywood=44121000, Glass=70051000, Fan=84145100, Pump=84137090,
    Refrigerant gas=38249099, Lathe/machine work=84589900, Magnetron=85402000,
+   Magnetar/magnet component=85051100, Air counter sensor/air sensor/proximity sensor=85269090,
+   Capacitor=85321000, Diode=85411000, Resistor=85334000, PCB/circuit board=85340000,
+   Transformer=85043300, Relay=85364900, Thermostat=90325000,
    Brazing rod=83112000, Gas torch=84689900, Service charges=998719
    For anything else use your best judgment.
 
@@ -924,7 +931,12 @@ def process():
         tax_id        = get_gst18_tax_id()
         line_items    = []
         new_items_log = []
-        for item in items:
+
+        # Match all items against Zoho list in one call
+        item_names_qb  = [item.get('name', '').strip() for item in items if item.get('name', '').strip()]
+        item_match_qb  = match_all_items(item_names_qb)
+
+        for idx, item in enumerate(items):
             name         = item.get('name', '').strip()
             qty          = float(item.get('quantity', 1))
             unit_price   = float(item.get('unit_price', 0))
@@ -932,7 +944,7 @@ def process():
             hsn          = item.get('hsn_or_sac', item.get('hsn_code', ''))
             is_service   = item.get('is_service', False)
             marked_price = round(unit_price * markup_factor, 2)
-            existing = find_item(name)
+            existing = item_match_qb.get(idx)
             if existing:
                 item_id = existing['item_id']
             else:
@@ -1280,6 +1292,30 @@ def send_estimate_email(estimate_id, to_email):
     )
     return r.json()
 
+def send_telegram_notification(quote_number, customer_name, created_by):
+    """Send quote creation notification via Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        by_line = f"\n👤 *Created by:* {created_by}" if created_by else ''
+        message = (
+            f"📋 *New Quote Created*\n"
+            f"🔢 *Quote No:* `{quote_number}`\n"
+            f"🏪 *Customer:* {customer_name}"
+            f"{by_line}"
+        )
+        requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+            json={
+                'chat_id':    TELEGRAM_CHAT_ID,
+                'text':       message,
+                'parse_mode': 'Markdown'
+            },
+            timeout=10
+        )
+    except Exception:
+        pass  # Never block quote creation due to notification failure
+
 def get_estimate_pdf(estimate_id):
     """Download estimate PDF bytes from Zoho."""
     token  = get_fresh_token()
@@ -1453,6 +1489,10 @@ QUOTEFORM_HTML = """<!DOCTYPE html>
       <div id="cust-dropdown" style="display:none;border:1.5px solid var(--border);border-radius:10px;margin-top:4px;background:#fff;max-height:220px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.08)"></div>
       <input type="hidden" id="cust-id">
       <input type="hidden" id="cust-state">
+    </div>
+    <div class="field">
+      <label>Your Name <span style="color:#9CA3AF;font-weight:400">(optional)</span></label>
+      <input type="text" id="created-by" placeholder="e.g. Ravi, Store Manager" autocomplete="off">
     </div>
     <div class="field">
       <label>Contact Email <span style="color:#9CA3AF;font-weight:400">(optional)</span></label>
@@ -1663,6 +1703,7 @@ async function submitForm(){
   const custName  = document.getElementById('cust-search').value.trim();
   const custState = document.getElementById('cust-state').value;
   const email     = document.getElementById('cust-email').value.trim();
+  const createdBy = document.getElementById('created-by').value.trim();
   const items     = getItems();
 
   if(!custId){ alert('Please select a customer from the list.'); return; }
@@ -1679,7 +1720,7 @@ async function submitForm(){
     const r = await fetch('/quoteform/generate', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({customer_id: custId, customer_name: custName, customer_state: custState, email, items})
+      body: JSON.stringify({customer_id: custId, customer_name: custName, customer_state: custState, email, created_by: createdBy, items})
     });
     const d = await r.json();
     result.style.display = 'block';
@@ -1780,6 +1821,7 @@ def quoteform_generate():
     customer_name = data.get('customer_name', '').strip()
     customer_state= data.get('customer_state', '').strip()
     email         = data.get('email', '').strip()
+    created_by    = data.get('created_by', '').strip()
     items_in      = data.get('items', [])
 
     if not customer_id or not items_in:
@@ -1861,6 +1903,13 @@ def quoteform_generate():
                 email_sent = True
             except Exception:
                 pass
+
+        # Send Telegram notification
+        send_telegram_notification(
+            quote_number  = est.get('estimate_number', 'N/A'),
+            customer_name = customer_name,
+            created_by    = created_by
+        )
 
         return jsonify({
             'status':          'success',
