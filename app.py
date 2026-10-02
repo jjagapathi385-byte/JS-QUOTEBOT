@@ -19,6 +19,10 @@ TOKEN_FILE    = "zoho_tokens.json"
 PORT          = int(os.environ.get('PORT', 5000))
 IS_RAILWAY    = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_SERVICE_NAME'))
 
+# ── QUOTEBOT CONFIG ───────────────────────────────────────────────────────────
+QUOTEBOT_PIN        = os.environ.get('QUOTEBOT_PIN', '0000')
+QUOTEBOT_TIMEOUT    = 300  # 5 minutes inactivity in seconds
+
 # ── QUOTEFORM CONFIG ──────────────────────────────────────────────────────────
 QUOTEFORM_PIN       = os.environ.get('QUOTEFORM_PIN', '0000')
 QUOTEFORM_TIMEOUT   = 300  # 5 minutes inactivity in seconds
@@ -783,7 +787,25 @@ def create_estimate(customer_id, customer_name, line_items, notes=''):
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
+    from flask import redirect
+    if not qb_logged_in():
+        return redirect('/qb-login')
     return render_template_string(HTML)
+
+@app.route('/qb-login', methods=['GET', 'POST'])
+def qb_login():
+    from flask import redirect
+    if request.method == 'POST':
+        pin = request.form.get('pin', '').strip()
+        if pin == QUOTEBOT_PIN:
+            session['qb_auth'] = True
+            session['qb_last'] = _time.time()
+            return redirect('/')
+        return render_template_string(QUOTEBOT_PIN_HTML, error=True)
+    if qb_logged_in():
+        return redirect('/')
+    expired = request.args.get('expired')
+    return render_template_string(QUOTEBOT_PIN_HTML, error=expired)
 
 @app.route('/status')
 def status():
@@ -898,6 +920,8 @@ def get_tokens():
 
 @app.route('/process', methods=['POST'])
 def process():
+    if not qb_logged_in():
+        return jsonify({'status': 'error', 'message': 'Session expired. Please login again.', 'redirect': '/qb-login'})
     body    = request.json or {}
     message = body.get('message', '').strip()
     if not message:
@@ -1198,6 +1222,9 @@ async function processMessage(){
     const r=await fetch('/process',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,markup})});
     const d=await r.json();
     res.style.display='block';
+    if(d.redirect){
+      window.location.href=d.redirect; return;
+    }
     if(d.status==='success'){
       res.className='result success';
       let ni='';
@@ -1223,8 +1250,77 @@ async function processMessage(){
   }
   btn.disabled=false;loader.style.display='none';
 }
+
+// ── Session timeout warning ──
+let _warnTimer, _expireTimer;
+function _resetTimers(){
+  clearTimeout(_warnTimer); clearTimeout(_expireTimer);
+  document.getElementById('qb-timeout-bar').style.display='none';
+  _warnTimer   = setTimeout(()=>{ document.getElementById('qb-timeout-bar').style.display='block'; }, 240000); // warn at 4 min
+  _expireTimer = setTimeout(()=>{ window.location.href='/qb-login?expired=1'; }, 300000); // expire at 5 min
+}
+document.addEventListener('click',   _resetTimers);
+document.addEventListener('input',   _resetTimers);
+document.addEventListener('keydown', _resetTimers);
+_resetTimers();
+
 checkStatus();
 </script>
+<div id="qb-timeout-bar" style="display:none;position:fixed;bottom:0;left:0;right:0;background:#1F2937;color:#fff;font-size:12px;padding:10px 16px;text-align:center;z-index:999">
+  ⏱ Session expiring soon — <a href="/qb-login" style="color:#60A5FA">login again</a>
+</div>
+</body>
+</html>"""
+
+# ── QUOTEBOT PIN HELPERS ──────────────────────────────────────────────────────
+def qb_logged_in():
+    """Check if QuoteBot session is valid and not timed out."""
+    if not session.get('qb_auth'):
+        return False
+    last = session.get('qb_last', 0)
+    if _time.time() - last > QUOTEBOT_TIMEOUT:
+        session.pop('qb_auth', None)
+        session.pop('qb_last', None)
+        return False
+    session['qb_last'] = _time.time()
+    return True
+
+QUOTEBOT_PIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>QuoteBot</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#F59E0B;--accent-h:#D97706;--r:14px}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:32px 24px;width:100%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .icon{width:48px;height:48px;background:var(--accent);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 20px}
+  h1{font-size:20px;font-weight:800;color:var(--ink);text-align:center;margin-bottom:6px}
+  .sub{font-size:13px;color:var(--muted);text-align:center;margin-bottom:28px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+  input[type=password]{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:13px;font-size:18px;text-align:center;letter-spacing:.3em;outline:none;color:var(--ink);transition:border .2s;-webkit-appearance:none}
+  input[type=password]:focus{border-color:var(--accent)}
+  .btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-top:14px;-webkit-tap-highlight-color:transparent}
+  .btn:active{background:var(--accent-h)}
+  .err{background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:10px 14px;font-size:13px;color:#7F1D1D;margin-top:12px;display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">⚡</div>
+  <h1>QuoteBot</h1>
+  <p class="sub">Enter your PIN to continue</p>
+  {% if error %}<div class="err" style="display:block">Incorrect PIN. Try again.</div>{% endif %}
+  <form method="POST" action="/qb-login">
+    <label>PIN</label>
+    <input type="password" name="pin" inputmode="numeric" autocomplete="off" autofocus maxlength="20" placeholder="••••">
+    <button type="submit" class="btn">Continue →</button>
+  </form>
+</div>
 </body>
 </html>"""
 
