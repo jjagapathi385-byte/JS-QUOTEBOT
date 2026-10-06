@@ -157,6 +157,7 @@ Return this exact JSON:
 {{
   "customer_name": "name here",
   "is_interstate": false,
+  "email": "email@example.com or empty string if none",
   "notes": "work description or context only — see rules below",
   "items": [
     {{
@@ -169,10 +170,10 @@ Return this exact JSON:
   ]
 }}
 
+For email field: extract email address if found anywhere in the message. Empty string if none.
 For notes field — strict rules:
 INCLUDE in notes:
 - Work description or context (e.g. "AC repair work", "walk in freezer", "glass door side holders assemble work")
-- Email address if mentioned in the message
 EXCLUDE from notes (set empty string if only these exist):
 - Any total / grand total lines (e.g. "Total 3200", "Total Cost 6500", "Grand Total")
 - "Please share the quotation" or similar share/send requests
@@ -991,17 +992,31 @@ def process():
                 "quantity": qty, "rate": marked_price,
                 **({"tax_id": tax_id} if tax_id else {})
             })
-        notes  = parsed.get('notes', '')
-        result = create_estimate(customer['contact_id'], customer.get('contact_name', customer_name), line_items, notes)
-        est    = result.get('estimate')
+        notes       = parsed.get('notes', '')
+        email       = parsed.get('email', '').strip()
+        result      = create_estimate(customer['contact_id'], customer.get('contact_name', customer_name), line_items, notes)
+        est         = result.get('estimate')
         if est:
+            estimate_id = est.get('estimate_id', '')
+            # Send email if found in message
+            email_sent = False
+            if email and estimate_id:
+                try:
+                    import logging
+                    email_result = send_estimate_email(estimate_id, email)
+                    email_sent   = email_result.get('code', -1) == 0
+                except Exception as ex:
+                    import logging
+                    logging.warning(f'QuoteBot email send error: {ex}')
             return jsonify({
-                'status': 'success',
+                'status':          'success',
                 'estimate_number': est.get('estimate_number', 'N/A'),
-                'customer': customer.get('contact_name', customer_name),
-                'total': est.get('total', 0),
+                'customer':        customer.get('contact_name', customer_name),
+                'total':           est.get('total', 0),
                 'currency_symbol': est.get('currency_symbol', '₹'),
-                'new_items': new_items_log
+                'new_items':       new_items_log,
+                'email_sent':      email_sent,
+                'email':           email
             })
         else:
             return jsonify({'status': 'error', 'message': f"Zoho error: {result}"})
@@ -1242,10 +1257,11 @@ async function processMessage(){
         const tags=d.new_items.map(i=>`<span class="new-tag">📦 ${i.name} <span class="hsn">${i.hsn}</span></span>`).join('');
         ni=`<div class="new-sec"><div class="new-title">🆕 New items added to Zoho</div>${tags}</div>`;
       }
+      const emailRow = d.email ? `<div class="result-row"><span class="rl">Email</span><span class="rv" style="color:${d.email_sent?'#059669':'#DC2626'}">${d.email_sent?'✓ Sent':'✗ Failed'} — ${d.email}</span></div>` : '';
       res.innerHTML=`<div class="result-title" style="color:#065F46">✅ Quotation Created!</div>
         <div class="result-row"><span class="rl">Quote No.</span><span class="rv">${d.estimate_number}</span></div>
         <div class="result-row"><span class="rl">Customer</span><span class="rv">${d.customer}</span></div>
-        <div class="result-row"><span class="rl">Total</span><span class="rt">${d.currency_symbol}${d.total}</span></div>${ni}`;
+        <div class="result-row"><span class="rl">Total</span><span class="rt">${d.currency_symbol}${d.total}</span></div>${emailRow}${ni}`;
     }else if(d.status==='customer_not_found'){
       res.className='result warning';
       res.innerHTML=`<div class="result-title" style="color:#92400E">⚠️ Customer Not Found</div>
