@@ -157,7 +157,7 @@ Return this exact JSON:
 {{
   "customer_name": "name here",
   "is_interstate": false,
-  "notes": "any subject/remarks/note text found in message, empty string if none",
+  "notes": "work description or context only — see rules below",
   "items": [
     {{
       "name": "item name",
@@ -169,7 +169,17 @@ Return this exact JSON:
   ]
 }}
 
-For notes: extract text like "Add subject- payment done", "payment pending", "urgent" etc. that is NOT an item. Just the content, not the label.
+For notes field — strict rules:
+INCLUDE in notes:
+- Work description or context (e.g. "AC repair work", "walk in freezer", "glass door side holders assemble work")
+- Email address if mentioned in the message
+EXCLUDE from notes (set empty string if only these exist):
+- Any total / grand total lines (e.g. "Total 3200", "Total Cost 6500", "Grand Total")
+- "Please share the quotation" or similar share/send requests
+- "Urgent" or similar filler words alone
+- "Send quotation" type phrases
+- Store name or customer name (already captured separately)
+If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
@@ -1368,25 +1378,34 @@ def get_all_customers():
     return result
 
 def send_estimate_email(estimate_id, to_email):
-    """Mark estimate as sent, then send PDF via Zoho email API."""
-    # Zoho requires estimate to be marked as sent before emailing
-    requests.post(
+    """Send estimate PDF via Zoho email API."""
+    import logging
+
+    # Step 1 — mark as sent (required by Zoho before emailing)
+    sent_r = requests.post(
         f'{ZOHO_BASE}/estimates/{estimate_id}/status/sent',
         headers=zh(),
         json={}
     )
+    sent_d = sent_r.json()
+    if sent_d.get('code', 0) not in [0, 'success']:
+        logging.warning(f'Mark as sent response: {sent_d}')
+
+    # Step 3 — send email using Zoho default template
+    # Empty subject/body lets Zoho use the default email template from settings
     payload = {
+        "to_mail_ids":            [to_email],
         "send_from_org_email_id": True,
-        "to_mail_ids": [to_email],
-        "subject": "Your Quotation",
-        "body": ""
+        "attach_pdf":             True
     }
     r = requests.post(
         f'{ZOHO_BASE}/estimates/{estimate_id}/email',
         headers=zh(),
         json=payload
     )
-    return r.json()
+    result = r.json()
+    logging.info(f'Email send result for {estimate_id}: {result}')
+    return result
 
 def send_telegram_notification(quote_number, customer_name, created_by):
     """Send quote creation notification via Telegram bot."""
@@ -1995,10 +2014,12 @@ def quoteform_generate():
         email_sent = False
         if email and estimate_id:
             try:
-                send_estimate_email(estimate_id, email)
-                email_sent = True
-            except Exception:
-                pass
+                email_result = send_estimate_email(estimate_id, email)
+                # Zoho returns code 0 on success
+                email_sent = email_result.get('code', -1) == 0
+            except Exception as e:
+                import logging
+                logging.warning(f'Email send exception: {e}')
 
         # Send Telegram notification
         send_telegram_notification(
