@@ -116,7 +116,9 @@ Message:
 ---
 
 Rules:
-1. Extract customer/store name from the first line or header
+1. Extract customer/store name from the first line or header.
+   Also extract store code if present (e.g. K318, P380, Z091) — store codes are a letter followed by 3-4 digits.
+   Include store code in customer_name field (e.g. "Ongole Pizza Hut P380").
 2. For each item: name, quantity (default 1), unit_price.
    - If total price given for multiple qty, divide to get unit_price (e.g. "5nos 1000" → unit=200)
    - Price may be STUCK to item name with no space — always split it:
@@ -124,6 +126,15 @@ Rules:
      "labour charges11000" → name="Labour Charges", unit_price=11000
      "cement12 bags 7400" → name="Cement", qty=12, unit_price=616
    - Always separate trailing numbers as price
+   - IMPORTANT: If NO individual prices are given but only a grand total exists:
+     Create ONE single line item. Use the work description as the item name
+     (e.g. "Electrical Work", "AC Repair Work", "Plumbing Work").
+     Set unit_price to the grand total value, qty=1.
+     List all the individual items mentioned as a comma-separated string in the "description" field.
+     Leave notes empty unless there is separate work context.
+     Example: message has "1.Wire 2.Lugs 3.Nuts Total 4000" →
+     item name="Electrical Work", unit_price=4000, qty=1,
+     description="16sq mm Wire, Pin Type Lugs, Nuts and Bolts"
 3. IMPORTANT - Correct item names: fix typos, expand abbreviations, use proper industry names.
    Examples:
    - "brazing rad pipe" → "Brazing Rod Pipe"
@@ -165,7 +176,8 @@ Return this exact JSON:
       "quantity": 1,
       "unit_price": 0.0,
       "hsn_or_sac": "12345678",
-      "is_service": false
+      "is_service": false,
+      "description": ""
     }}
   ]
 }}
@@ -297,8 +309,11 @@ def extract_store_code(text):
         return (match.group(1).upper() + match.group(2)).upper()
     return None
 
-def find_customer(name):
-    """Find customer — store code match first, then brand+location AI match."""
+def find_customer(name, raw_message=None):
+    """Find customer — store code match first, then brand+location AI match.
+    raw_message: original unparsed message — used to extract store code
+    directly in case AI missed it in the customer name.
+    """
     # Fetch all customers
     all_contacts = []
     page = 1
@@ -315,7 +330,10 @@ def find_customer(name):
         return None
 
     # ── Step 1: Store code direct match (no AI needed) ───────────────────────
+    # Try parsed name first, then fall back to raw message
     store_code = extract_store_code(name)
+    if not store_code and raw_message:
+        store_code = extract_store_code(raw_message)
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
@@ -347,6 +365,10 @@ def find_customer(name):
             brand = brand_from_code
 
     # Filter customer list by brand if detected
+    # If no brand and no store code found → default to KFC (majority of stores)
+    if not brand and not store_code:
+        brand = 'KFC'
+
     if brand:
         if brand == 'KFC':
             filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
@@ -952,7 +974,9 @@ def process():
         items         = parsed.get('items', [])
         if not customer_name:
             return jsonify({'status': 'error', 'message': 'Could not detect customer name.'})
-        customer = find_customer(customer_name)
+        # Pass both parsed name AND raw message to find_customer
+        # so store code is extracted from original message if AI missed it
+        customer = find_customer(customer_name, raw_message=message)
         if not customer:
             return jsonify({
                 'status': 'customer_not_found',
@@ -987,9 +1011,13 @@ def process():
                 item_id = created.get('item_id', '')
                 label   = 'SAC' if is_service else 'HSN'
                 new_items_log.append({'name': name, 'hsn': f"{label}: {hsn}" if hsn else 'Auto-assigned', 'rate': marked_price})
+            description = item.get('description', '').strip()
             line_items.append({
-                "item_id": item_id, "name": name,
-                "quantity": qty, "rate": marked_price,
+                "item_id":     item_id,
+                "name":        name,
+                "quantity":    qty,
+                "rate":        marked_price,
+                **({"description": description} if description else {}),
                 **({"tax_id": tax_id} if tax_id else {})
             })
         notes       = parsed.get('notes', '')
