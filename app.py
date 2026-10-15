@@ -778,11 +778,16 @@ def get_next_seq():
 
 def create_estimate(customer_id, customer_name, line_items, notes=''):
     """Create estimate with correct number directly — works in both auto and manual Zoho mode."""
-    clean_name = customer_name.strip().upper().replace(' ', '_')
+    # Extract last segment of customer name as store code
+    # e.g. "PHD-OGL-GUNT-RD-HYDR-P380" → "P380"
+    # e.g. "KFC-ATTAPUR-HYD-K318" → "K318"
+    parts      = customer_name.strip().upper().split('-')
+    last_seg   = parts[-1].strip().replace(' ', '_') if parts else customer_name.strip().upper()
+    prefix     = f"JSINT-{last_seg}"
 
     for attempt in range(5):  # Retry up to 5 times on conflict
         seq           = get_next_seq() + attempt
-        custom_number = f"{clean_name}-QT-{str(seq).zfill(6)}"
+        custom_number = f"{prefix}-QT-{str(seq).zfill(6)}"
 
         payload = {
             "customer_id":     customer_id,
@@ -905,7 +910,7 @@ def next_number():
         <h2>📋 Next Quote Number</h2>
         <p>Use this sequence number when creating a quote manually in Zoho.</p>
         <div class="num">{{ next_no }}</div>
-        <div class="format">Format: <strong>STORENAME-QT-{{ next_no }}</strong><br>e.g. KFC-SURYAPET-QT-{{ next_no }}</div>
+        <div class="format">Format: <strong>JSINT-{STORECODE}-QT-{{ next_no }}</strong><br>e.g. JSINT-K318-QT-{{ next_no }}</div>
         <button onclick="navigator.clipboard.writeText('{{ next_no }}').then(()=>alert('Copied!'))">Copy Number</button>
         </body></html>""", next_no=next_no)
     except Exception as e:
