@@ -152,7 +152,17 @@ Rules:
    - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
    - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
    Always use proper English, correct spelling, full words.
-4. For hsn_or_sac: use "995459" as placeholder — HSN codes are assigned separately after parsing.
+4. Assign the most accurate 8-digit HSN code. Common ones:
+   LED lights/lamps=94054090, Tape=39199090, Adhesive/Fevicol/Fevibond=35069900,
+   PVC pipe=39172300, Wire/cable=85444290, Switch/socket=85363010, MCB=85362000,
+   Paint=32089090, Cement=25232900, Steel/iron=72142000, Screws/bolts=73181500,
+   Plywood=44121000, Glass=70051000, Fan=84145100, Pump=84137090,
+   Refrigerant gas=38249099, Lathe/machine work=84589900, Magnetron=85402000,
+   Magnetar/magnet component=85051100, Air counter sensor/air sensor/proximity sensor=85269090,
+   Capacitor=85321000, Diode=85411000, Resistor=85334000, PCB/circuit board=85340000,
+   Transformer=85043300, Relay=85364900, Thermostat=90325000,
+   Brazing rod=83112000, Gas torch=84689900, Service charges=998719
+   For anything else use your best judgment.
 
 Return this exact JSON:
 {{
@@ -186,7 +196,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = [ 'openai/gpt-oss-20b','openai/gpt-oss-120b'] 
+    models = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant'] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -201,42 +211,39 @@ ONLY return the JSON. Nothing else."""
                 json={
                     'model': model,
                     'messages': [{'role': 'user', 'content': prompt}],
-                    'temperature': 0,
-                    'max_tokens': 800
+                    'temperature': 0.1,
+                    'max_tokens': 2000
                 },
                 timeout=60
             )
             d = r.json()
 
-            # Rate limit — wait longer and retry with next model
+            # Rate limit — wait and retry with next model
             if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                wait = 10 * (attempt + 1)
-                last_error = f"Rate limited on {model}, waiting {wait}s"
+                wait = 5 * (attempt + 1)
                 time.sleep(wait)
                 continue
 
-            # Model error (unavailable, no access etc.) — try next model
+            # Other API error
             if 'error' in d:
                 err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                last_error = f"Model {model} error: {err_msg}"
-                time.sleep(3)
-                continue
+                raise Exception(f"Groq error: {err_msg}")
 
             if 'choices' not in d or not d['choices']:
-                last_error = f"No choices from {model}: {str(d)[:200]}"
+                last_error = str(d)[:300]
                 time.sleep(3)
                 continue
 
             try:
                 raw = d['choices'][0]['message']['content'].strip()
             except (KeyError, IndexError) as ke:
-                last_error = f"Parse error on {model}: {ke}"
+                last_error = f"Parse error: {ke} in {str(d)[:200]}"
                 time.sleep(3)
                 continue
 
             if not raw:
-                last_error = f"Empty response from {model}"
-                time.sleep(5)
+                last_error = "Empty AI response"
+                time.sleep(3)
                 continue
 
             # Strip markdown fences
@@ -250,15 +257,14 @@ ONLY return the JSON. Nothing else."""
             return json.loads(raw)
 
         except json.JSONDecodeError:
-            last_error = 'JSON decode error'
             time.sleep(2)
             continue
         except requests.exceptions.Timeout:
-            last_error = f'Timeout on {model}'
             time.sleep(3)
             continue
         except Exception as e:
-            last_error = str(e)
+            if 'Groq error' in str(e):
+                raise
             time.sleep(2)
             continue
 
@@ -295,16 +301,9 @@ BRAND_PREFIXES = {
 }
 
 def extract_store_code(text):
-    """Extract store code from text. Handles:
-    - Standard codes: K589, Y044, Z091, P287, C499
-    - Paradise codes: S11R29, S11R06, S34R01 etc.
-    """
+    """Extract store code like K589, Y044, Z091, P287, C499 from text."""
     import re
-    # Paradise style: S + digits + R + digits (e.g. S11R29, S34R01)
-    match = re.search(r'\b(S\d{1,2}R\d{2,3})\b', text, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    # Standard style: single letter prefix + 3-4 digits
+    # Match a letter prefix followed by 3+ digits (case-insensitive)
     match = re.search(r'\b([KYPZCVkypcvz])(\d{3,4})\b', text)
     if match:
         return (match.group(1).upper() + match.group(2)).upper()
@@ -338,13 +337,11 @@ def find_customer(name, raw_message=None):
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
-            # Match store code anywhere in name — end, middle, or exact
-            if (cname.endswith(f'-{store_code}') or
-                f'-{store_code}-' in cname or
-                f'-{store_code}' in cname or
-                cname == store_code):
+            # Store code is always the last segment after final dash e.g. KFC-GUDIMALKAPUR-HYD-K589
+            if cname.endswith(f'-{store_code}') or f'-{store_code}-' in cname or cname == store_code:
                 return c
-        # Code found in input but no exact match — continue to AI (handles typos)
+        # If code found in input but no exact match, warn but continue to AI
+        # (handles typos in code)
 
     # ── Step 2: Brand filter + AI location match ──────────────────────────────
     name_upper = name.upper()
@@ -359,8 +356,6 @@ def find_customer(name, raw_message=None):
         brand = 'COSTA'
     elif 'VAANGO' in name_upper:
         brand = 'VAANGO'
-    elif 'PARADISE' in name_upper:
-        brand = 'PARADISE'
 
     # Also detect brand from store code prefix if present
     if not brand and store_code:
@@ -383,8 +378,6 @@ def find_customer(name, raw_message=None):
             filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
         elif brand == 'VAANGO':
             filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
-        elif brand == 'PARADISE':
-            filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
         else:
             filtered = all_contacts
     else:
@@ -407,12 +400,8 @@ Customers:
 Rules:
 1. Match by LOCATION — find the customer whose location words best match the input.
 2. All customers in this list are already the correct brand — just find the right location.
-3. Store codes like K589, Y044, S11R29 are in the customer name — if the input has a code, match it exactly.
-4. For location matching — ignore hyphens and abbreviations:
-   "moosapet" matches "MOOSAPET", "balanagar" matches "BALANAGAR",
-   "malkajgiri" matches "MALKAJGIRI", "asraonagar" matches "ASRAO-NAGAR" or "ASRAONAGAR"
-5. Partial location match is acceptable if it's clearly the same place.
-6. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
+3. Store codes like K589, Y044 are at the end of the customer name — if the input has a code, match it exactly.
+4. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
 
     r2 = requests.post(
         'https://api.groq.com/openai/v1/chat/completions',
@@ -465,63 +454,34 @@ def match_all_items(item_names):
     if not all_items:
         return {i: None for i in range(len(item_names))}
 
-    # ── Local fuzzy match first — no tokens ──────────────────────────────────
-    import difflib
-    result      = {}
-    needs_ai    = []  # (original_idx, name) not matched locally
+    zoho_names = "\n".join([f"{i+1}. {itm['name']}" for i, itm in enumerate(all_items)])
+    input_names = "\n".join([f"{i+1}. {name}" for i, name in enumerate(item_names)])
 
-    zoho_name_map = {itm['name'].lower().strip(): itm for itm in all_items}
-    zoho_names_list = list(zoho_name_map.keys())
+    prompt = f"""Match each input item to the closest item in the Zoho list.
 
-    for i, name in enumerate(item_names):
-        name_lower = name.lower().strip()
-        # Exact match
-        if name_lower in zoho_name_map:
-            result[i] = zoho_name_map[name_lower]
-            continue
-        # Close match (85% similarity threshold)
-        close = difflib.get_close_matches(name_lower, zoho_names_list, n=1, cutoff=0.85)
-        if close:
-            result[i] = zoho_name_map[close[0]]
-        else:
-            needs_ai.append((i, name))
-
-    # All matched locally — no Groq needed
-    if not needs_ai:
-        return result
-
-    # ── Groq only for unmatched items — send trimmed Zoho list ───────────────
-    # Only include Zoho items that share at least one significant word with any unmatched input
-    unmatched_words = set()
-    for _, name in needs_ai:
-        for w in name.lower().split():
-            if len(w) > 3:
-                unmatched_words.add(w)
-
-    relevant_items = [
-        itm for itm in all_items
-        if any(w in itm['name'].lower() for w in unmatched_words)
-    ] or all_items[:100]  # fallback: first 100 if no word overlap
-
-    zoho_names  = "\n".join([f"{i+1}. {itm['name']}" for i, itm in enumerate(relevant_items)])
-    input_names = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
-
-    prompt = f"""Match each input item to the closest Zoho item.
-
-Input:
+Input items:
 {input_names}
 
 Zoho items:
 {zoho_names}
 
-Rules: match by similarity (abbreviations, plurals ok). Min 70% match. Use 0 if no match.
+Rules:
+1. For each input item, find the best matching Zoho item number.
+2. Consider abbreviations, plurals, alternate spellings (e.g. "LED Light" matches "LED Lights").
+3. Only match if similarity is at least 70%. Otherwise use 0.
+4. Each input item gets exactly one result.
 
-Reply ONLY as JSON array:
-[{{"input":1,"zoho":5}},{{"input":2,"zoho":0}}]"""
+Reply ONLY with a valid JSON array, one entry per input item, in order:
+[
+  {{"input": 1, "zoho": 5}},
+  {{"input": 2, "zoho": 0}},
+  {{"input": 3, "zoho": 12}}
+]
+0 means no match found. Nothing else in your response."""
 
     import time
     import logging
-    models     = [ 'openai/gpt-oss-20b','openai/gpt-oss-120b']
+    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -534,7 +494,7 @@ Reply ONLY as JSON array:
                     'model':       model,
                     'messages':    [{'role': 'user', 'content': prompt}],
                     'temperature': 0,
-                    'max_tokens':  300
+                    'max_tokens':  500
                 },
                 timeout=60
             )
@@ -579,13 +539,13 @@ Reply ONLY as JSON array:
                 time.sleep(2)
                 continue
 
-            # Map Groq results back to original indices using needs_ai and relevant_items
+            # Build result dict
+            result = {i: None for i in range(len(item_names))}
             for entry in parsed:
-                ai_input_idx = int(entry.get('input', 0)) - 1
-                zoho_idx     = int(entry.get('zoho', 0)) - 1
-                if 0 <= ai_input_idx < len(needs_ai) and 0 <= zoho_idx < len(relevant_items):
-                    orig_idx        = needs_ai[ai_input_idx][0]
-                    result[orig_idx] = relevant_items[zoho_idx]
+                input_idx = int(entry.get('input', 0)) - 1
+                zoho_idx  = int(entry.get('zoho', 0)) - 1
+                if 0 <= input_idx < len(item_names) and 0 <= zoho_idx < len(all_items):
+                    result[input_idx] = all_items[zoho_idx]
             return result
 
         except json.JSONDecodeError:
@@ -602,8 +562,8 @@ Reply ONLY as JSON array:
             continue
 
     logging.warning(f'match_all_items failed after all attempts: {last_error}')
-    # Return local matches — unmatched items will be created as new
-    return result
+    # On total failure return None for all — caller will attempt to create
+    return {i: None for i in range(len(item_names))}
 
 
 
@@ -642,90 +602,16 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
         raise Exception(f"Item creation failed: {resp}")
     return item
 
-# ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
-HSN_KEYWORDS = [
-    # Services
-    (['ac ', 'hvac', 'air condition', 'air-condition'],                         ('995463', True)),
-    (['repair', 'maintenance', 'servic'],                                        ('995469', True)),
-    (['concrete', 'rcc'],                                                        ('995454', True)),
-    (['structural steel', 'steel erect'],                                        ('995455', True)),
-    (['masonry', 'brickwork', 'brick work'],                                     ('995456', True)),
-    (['scaffold'],                                                               ('995457', True)),
-    (['special trade', 'construction'],                                          ('995458', True)),
-    (['floor', 'tiling', 'tile'],                                               ('995474', True)),
-    (['building completion', 'finishing'],                                       ('995478', True)),
-    (['machinery repair', 'machine repair'],                                     ('998717', True)),
-    (['equipment repair'],                                                       ('998719', True)),
-    (['labour', 'labor', 'manpower', 'workforce'],                              ('995511', True)),
-    (['cleaning', 'housekeeping'],                                               ('998531', True)),
-    # Refrigeration / HVAC goods
-    (['compressor', 'refriger'],                                                ('84143090', False)),
-    (['compressor part', 'fan part'],                                            ('84149090', False)),
-    (['refrigeration equip'],                                                    ('84189900', False)),
-    (['centrifugal pump', 'pump'],                                               ('84137090', False)),
-    # Electrical goods
-    (['tempe box', 'distribution board', 'db box', 'panel board', 'mcb box'],   ('85371000', False)),
-    (['armoured cable', 'armored cable', 'copper armoured', 'cable'],           ('85444290', False)),
-    (['mcb', 'circuit breaker', 'breaker'],                                     ('85362000', False)),
-    (['wire', 'sq mm'],                                                          ('85444290', False)),
-    (['copper ring lug', 'copper pin', 'lug'],                                  ('85369090', False)),
-    (['switch', 'socket', 'plug'],                                               ('85363010', False)),
-    (['led', 'light', 'lamp', 'bulb', 'fitting'],                               ('94054090', False)),
-    (['fan'],                                                                    ('84145100', False)),
-    # Pipes / fittings
-    (['pvc casing', 'casing box', 'pvc box'],                                   ('39172300', False)),
-    (['pvc pipe', 'conduit'],                                                    ('39172300', False)),
-    (['patti', 'gi strip', 'earth strip'],                                       ('72142000', False)),
-    # Hardware
-    (['screw', 'bolt', 'nut', 'fastener'],                                       ('73181500', False)),
-    # Paint / adhesive
-    (['paint', 'primer', 'putty', 'varnish'],                                   ('32089090', False)),
-    (['tape', 'adhesive', 'fevicol', 'fevibond', 'sealant', 'silicone'],        ('35069900', False)),
-    # Other
-    (['accessory', 'accessories', 'misc', 'sundry', 'consumable'],              ('85389000', False)),
-]
-
-def local_hsn_lookup(item_name):
-    """Keyword-based HSN lookup — instant, no tokens.
-    Returns (hsn_code, is_service) or None if no match.
-    """
-    name_lower = item_name.lower()
-    for keywords, result in HSN_KEYWORDS:
-        if any(kw in name_lower for kw in keywords):
-            return result
-    return None
-
 def detect_hsn_for_items(items):
     """
-    Detect HSN/SAC codes for all items.
-    Step 1: Local keyword lookup (instant, no tokens)
-    Step 2: Groq AI call only for items not matched locally
+    Single Groq call to detect HSN/SAC code and goods/service flag for all items.
+    items: list of name strings
     Returns: dict keyed by index {0: {hsn_or_sac, is_service}, ...}
     """
     if not items:
         return {}
 
-    import time
-    import logging
-    import re as _re
-
-    # ── Step 1: Local keyword lookup for all items ────────────────────────────
-    result       = {}
-    needs_ai     = []   # (original_idx, name) for items not matched locally
-
-    for i, name in enumerate(items):
-        local = local_hsn_lookup(name)
-        if local:
-            result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
-        else:
-            needs_ai.append((i, name))
-
-    # If all items matched locally — return immediately, no Groq needed
-    if not needs_ai:
-        return result
-
-    # ── Step 2: Groq call only for unmatched items ────────────────────────────
-    items_numbered = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
+    items_numbered = "\n".join([f"{i+1}. {name}" for i, name in enumerate(items)])
 
     prompt = f"""You are an Indian GST expert. For each item below, provide the correct HSN code (for goods) or SAC code (for services).
 
@@ -734,21 +620,39 @@ Items:
 
 Rules:
 1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
-2. Common codes:
-   Magnetar/magnet=85051100, Air sensor/counter sensor=85269090,
-   Capacitor=85321000, Diode=85411000, Resistor=85334000,
-   Transformer=85043300, Relay=85364900, Thermostat=90325000,
-   Refrigerant gas=38249099, Brazing rod=83112000, Gas torch=84689900,
-   Plywood/wood=44121000, Tools/drill=82051000, Safety equip=39262090,
-   Cement=25232900, Cleaning chemical=34029090
+2. Use these exact codes where applicable:
+   LED lights/lamps → 94054090, goods
+   Tape/adhesive/Fevicol/Fevibond → 35069900, goods
+   PVC pipe/fittings → 39172300, goods
+   Wire/cable → 85444290, goods
+   Switch/socket → 85363010, goods
+   MCB/breaker → 85362000, goods
+   Paint/primer/putty → 32089090, goods
+   Cement → 25232900, goods
+   Steel/iron → 72142000, goods
+   Screws/bolts/nuts → 73181500, goods
+   Plywood/wood → 44121000, goods
+   Fan → 84145100, goods
+   Pump → 84137090, goods
+   Tools (hammers, drills) → 82051000, goods
+   Safety equipment (gloves, helmets) → 39262090, goods
+   Cleaning materials/chemicals → 34029090, goods
+   Cleaning/housekeeping service → 998531, service
+   Maintenance/repair service → 995469, service
+   Labour charges → 995511, service
+   Security service → 998523, service
 3. If genuinely unsure → HSN 99999999 for goods, SAC 999999 for services.
 
-Reply ONLY with a valid JSON array:
+Reply ONLY with a valid JSON array. No markdown, no explanation, nothing else:
 [
-  {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
+  {{"item": 1, "hsn_or_sac": "94054090", "is_service": false}},
+  {{"item": 2, "hsn_or_sac": "998531", "is_service": true}}
 ]"""
 
-    models     = [ 'openai/gpt-oss-20b','openai/gpt-oss-120b']
+    import time
+    import logging
+    import re as _re
+    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -761,7 +665,7 @@ Reply ONLY with a valid JSON array:
                     'model':       model,
                     'messages':    [{'role': 'user', 'content': prompt}],
                     'temperature': 0,
-                    'max_tokens':  400
+                    'max_tokens':  1000
                 },
                 timeout=60
             )
@@ -814,12 +718,12 @@ Reply ONLY with a valid JSON array:
                 time.sleep(2)
                 continue
 
-            # Map Groq results back to original item indices
+            # Build result dict keyed by 0-based item index
+            result = {}
             for entry in parsed:
-                ai_idx = int(entry.get('item', 0)) - 1
-                if 0 <= ai_idx < len(needs_ai):
-                    orig_idx = needs_ai[ai_idx][0]
-                    result[orig_idx] = {
+                idx = int(entry.get('item', 0)) - 1
+                if idx >= 0:
+                    result[idx] = {
                         'hsn_or_sac': str(entry.get('hsn_or_sac', '99999999')),
                         'is_service':  bool(entry.get('is_service', False))
                     }
@@ -838,9 +742,8 @@ Reply ONLY with a valid JSON array:
             time.sleep(2)
             continue
 
-    # Groq failed — return what local lookup found, rest get 99999999
-    logging.warning(f'detect_hsn_for_items Groq failed: {last_error}')
-    return result
+    logging.warning(f'detect_hsn_for_items failed after all attempts: {last_error}')
+    return {}
 
 
 _last_seq = {'value': 0}
@@ -875,16 +778,11 @@ def get_next_seq():
 
 def create_estimate(customer_id, customer_name, line_items, notes=''):
     """Create estimate with correct number directly — works in both auto and manual Zoho mode."""
-    # Extract last segment of customer name as store code
-    # e.g. "PHD-OGL-GUNT-RD-HYDR-P380" → "P380"
-    # e.g. "KFC-ATTAPUR-HYD-K318" → "K318"
-    parts      = customer_name.strip().upper().split('-')
-    last_seg   = parts[-1].strip().replace(' ', '_') if parts else customer_name.strip().upper()
-    prefix     = f"JSINT-{last_seg}"
+    clean_name = customer_name.strip().upper().replace(' ', '_')
 
     for attempt in range(5):  # Retry up to 5 times on conflict
         seq           = get_next_seq() + attempt
-        custom_number = f"{prefix}-QT-{str(seq).zfill(6)}"
+        custom_number = f"{clean_name}-QT-{str(seq).zfill(6)}"
 
         payload = {
             "customer_id":     customer_id,
@@ -1007,7 +905,7 @@ def next_number():
         <h2>📋 Next Quote Number</h2>
         <p>Use this sequence number when creating a quote manually in Zoho.</p>
         <div class="num">{{ next_no }}</div>
-        <div class="format">Format: <strong>JSINT-{STORECODE}-QT-{{ next_no }}</strong><br>e.g. JSINT-K318-QT-{{ next_no }}</div>
+        <div class="format">Format: <strong>STORENAME-QT-{{ next_no }}</strong><br>e.g. KFC-SURYAPET-QT-{{ next_no }}</div>
         <button onclick="navigator.clipboard.writeText('{{ next_no }}').then(()=>alert('Copied!'))">Copy Number</button>
         </body></html>""", next_no=next_no)
     except Exception as e:
@@ -2223,7 +2121,7 @@ ONLY return the JSON array. Nothing else."""
                 'model': 'openai/gpt-oss-120b',
                 'messages': [{'role': 'user', 'content': prompt}],
                 'temperature': 0.1,
-                'max_tokens': 400
+                'max_tokens': 1000
             },
             timeout=30
         )
