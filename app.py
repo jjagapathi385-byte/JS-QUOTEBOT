@@ -152,7 +152,7 @@ Rules:
    - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
    - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
    Always use proper English, correct spelling, full words.
-4. For hsn_or_sac: use "99999999" as placeholder — HSN codes are assigned separately after parsing.
+4. For hsn_or_sac: use "995459" as placeholder — HSN codes are assigned separately after parsing.
 
 Return this exact JSON:
 {{
@@ -186,7 +186,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b'] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', ''] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -521,7 +521,7 @@ Reply ONLY as JSON array:
 
     import time
     import logging
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -748,7 +748,7 @@ Reply ONLY with a valid JSON array:
   {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
     last_error = 'No response received'
 
     for attempt in range(4):
