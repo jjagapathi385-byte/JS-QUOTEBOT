@@ -186,7 +186,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b'] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -521,7 +521,7 @@ Reply ONLY as JSON array:
 
     import time
     import logging
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -748,7 +748,7 @@ Reply ONLY with a valid JSON array:
   {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3-32b']
     last_error = 'No response received'
 
     for attempt in range(4):
