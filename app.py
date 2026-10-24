@@ -744,7 +744,7 @@ Reply ONLY with a valid JSON array:
   {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
