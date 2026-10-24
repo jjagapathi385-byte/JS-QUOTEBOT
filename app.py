@@ -152,7 +152,7 @@ Rules:
    - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
    - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
    Always use proper English, correct spelling, full words.
-4. For hsn_or_sac: use "995459" as placeholder — HSN codes are assigned separately after parsing.
+4. For hsn_or_sac: use "99999999" as placeholder — HSN codes are assigned separately after parsing.
 
 Return this exact JSON:
 {{
@@ -186,7 +186,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b'] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -208,32 +208,35 @@ ONLY return the JSON. Nothing else."""
             )
             d = r.json()
 
-            # Rate limit — wait and retry with next model
+            # Rate limit — wait longer and retry with next model
             if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                wait = 5 * (attempt + 1)
+                wait = 10 * (attempt + 1)
+                last_error = f"Rate limited on {model}, waiting {wait}s"
                 time.sleep(wait)
                 continue
 
-            # Other API error
+            # Model error (unavailable, no access etc.) — try next model
             if 'error' in d:
                 err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                raise Exception(f"Groq error: {err_msg}")
+                last_error = f"Model {model} error: {err_msg}"
+                time.sleep(3)
+                continue
 
             if 'choices' not in d or not d['choices']:
-                last_error = str(d)[:300]
+                last_error = f"No choices from {model}: {str(d)[:200]}"
                 time.sleep(3)
                 continue
 
             try:
                 raw = d['choices'][0]['message']['content'].strip()
             except (KeyError, IndexError) as ke:
-                last_error = f"Parse error: {ke} in {str(d)[:200]}"
+                last_error = f"Parse error on {model}: {ke}"
                 time.sleep(3)
                 continue
 
             if not raw:
-                last_error = "Empty AI response"
-                time.sleep(3)
+                last_error = f"Empty response from {model}"
+                time.sleep(5)
                 continue
 
             # Strip markdown fences
@@ -247,14 +250,15 @@ ONLY return the JSON. Nothing else."""
             return json.loads(raw)
 
         except json.JSONDecodeError:
+            last_error = 'JSON decode error'
             time.sleep(2)
             continue
         except requests.exceptions.Timeout:
+            last_error = f'Timeout on {model}'
             time.sleep(3)
             continue
         except Exception as e:
-            if 'Groq error' in str(e):
-                raise
+            last_error = str(e)
             time.sleep(2)
             continue
 
@@ -517,7 +521,7 @@ Reply ONLY as JSON array:
 
     import time
     import logging
-    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -744,7 +748,7 @@ Reply ONLY with a valid JSON array:
   {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    models     = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
