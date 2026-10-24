@@ -186,7 +186,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', ''] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'] 
     last_error = 'No response received'
 
     for attempt in range(4):
