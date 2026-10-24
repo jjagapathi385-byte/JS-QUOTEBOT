@@ -152,7 +152,7 @@ Rules:
    - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
    - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
    Always use proper English, correct spelling, full words.
-4. For hsn_or_sac: use "99999999" as placeholder — HSN codes are assigned separately after parsing.
+4. For hsn_or_sac: use "995459" as placeholder — HSN codes are assigned separately after parsing.
 
 Return this exact JSON:
 {{
@@ -186,7 +186,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant'] 
+    models = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'] 
     last_error = 'No response received'
 
     for attempt in range(4):
