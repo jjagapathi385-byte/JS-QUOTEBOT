@@ -243,44 +243,16 @@ Rules:
      Set unit_price to the grand total value, qty=1.
      List all the individual items mentioned as a comma-separated string in the "description" field.
      Leave notes empty unless there is separate work context.
-     Example: message has "1.Wire 2.Lugs 3.Nuts Total 4000" →
-     item name="Electrical Work", unit_price=4000, qty=1,
-     description="16sq mm Wire, Pin Type Lugs, Nuts and Bolts"
 3. IMPORTANT - Correct item names: fix typos, expand abbreviations, use proper industry names.
-   Examples:
-   - "brazing rad pipe" → "Brazing Rod Pipe"
-   - "let machine work" → "Lathe Machine Work"
-   - "magnitor" → "Magnetron"
-   - "fevi bond" → "Fevibond Adhesive"
-   - "LPG gas tarch" → "LPG Gas Torch"
-   - "R 32 gas" → "R32 Refrigerant Gas"
-   - "led lt" → "LED Light"
-   - "ac servic" → "AC Service"
-   - "scolding" → "Scaffolding"
-   - "Lappam patty" → "Lappam Putty"
-   - "birla white care putty" → "Birla White Care Putty"
-   - "paint roller.1200" → name="Paint Roller", price=1200 (period is separator not decimal)
-   - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
-   - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
    Always use proper English, correct spelling, full words.
-4. Assign the most accurate 8-digit HSN code. Common ones:
-   LED lights/lamps=94054090, Tape=39199090, Adhesive/Fevicol/Fevibond=35069900,
-   PVC pipe=39172300, Wire/cable=85444290, Switch/socket=85363010, MCB=85362000,
-   Paint=32089090, Cement=25232900, Steel/iron=72142000, Screws/bolts=73181500,
-   Plywood=44121000, Glass=70051000, Fan=84145100, Pump=84137090,
-   Refrigerant gas=38249099, Lathe/machine work=84589900, Magnetron=85402000,
-   Magnetar/magnet component=85051100, Air counter sensor/air sensor/proximity sensor=85269090,
-   Capacitor=85321000, Diode=85411000, Resistor=85334000, PCB/circuit board=85340000,
-   Transformer=85043300, Relay=85364900, Thermostat=90325000,
-   Brazing rod=83112000, Gas torch=84689900, Service charges=998719
-   For anything else use your best judgment.
+4. Assign the most accurate 8-digit HSN code.
 
 Return this exact JSON:
 {{
   "customer_name": "name here",
   "is_interstate": false,
   "email": "email@example.com or empty string if none",
-  "notes": "work description or context only — see rules below",
+  "notes": "work description or context only",
   "items": [
     {{
       "name": "item name",
@@ -293,95 +265,23 @@ Return this exact JSON:
   ]
 }}
 
-For email field: extract email address if found anywhere in the message. Empty string if none.
-For notes field — strict rules:
-INCLUDE in notes:
-- Work description or context (e.g. "AC repair work", "walk in freezer", "glass door side holders assemble work")
-EXCLUDE from notes (set empty string if only these exist):
-- Any total / grand total lines (e.g. "Total 3200", "Total Cost 6500", "Grand Total")
-- "Please share the quotation" or similar share/send requests
-- "Urgent" or similar filler words alone
-- "Send quotation" type phrases
-- Store name or customer name (already captured separately)
-If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
-    import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'] 
-    last_error = 'No response received'
+    try:
+        # Call AI with automatic Groq -> Gemini fallback
+        raw = call_ai_with_fallback(prompt, max_tokens=2000)
 
-    for attempt in range(4):
-        model = models[min(attempt, len(models)-1)]
-        try:
-            r = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {GROQ_KEY}',
-                    'Content-Type': 'application/json'
-                },
-                json={
-                    'model': model,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'temperature': 0.1,
-                    'max_tokens': 2000
-                },
-                timeout=60
-            )
-            d = r.json()
+        # Strip markdown fences
+        if '```' in raw:
+            parts = raw.split('```')
+            raw = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith('json'):
+                raw = raw[4:]
+            raw = raw.strip()
 
-            # Rate limit — wait longer and try next model
-            if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                wait = 10 * (attempt + 1)
-                last_error = f"Rate limited on {model}"
-                time.sleep(wait)
-                continue
-
-            # Model unavailable or any API error — try next model, don't raise
-            if 'error' in d:
-                err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                last_error = f"Model {model} error: {err_msg}"
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d or not d['choices']:
-                last_error = f"No choices from {model}: {str(d)[:200]}"
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = f"Parse error on {model}: {ke}"
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = f"Empty response from {model}"
-                time.sleep(5)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'):
-                    raw = raw[4:]
-                raw = raw.strip()
-
-            return json.loads(raw)
-
-        except json.JSONDecodeError:
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    raise Exception(f"AI service unavailable. Last error: {last_error}. Please wait 30 seconds and try again.")
+        return json.loads(raw)
+    except Exception as e:
+        raise Exception(f"AI service unavailable. Last error: {str(e)}. Please wait 30 seconds and try again.")
 
 # ── ZOHO HELPERS ──────────────────────────────────────────────────────────────
 def get_gst18_tax_id():
