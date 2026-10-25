@@ -279,7 +279,24 @@ ONLY return the JSON. Nothing else."""
                 raw = raw[4:]
             raw = raw.strip()
 
-        return json.loads(raw)
+        # Isolate JSON object boundaries
+        if '{' in raw and '}' in raw:
+            start = raw.find('{')
+            end = raw.rfind('}') + 1
+            raw = raw[start:end]
+
+        # Try parsing directly; if single quotes were used, safely fix them
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            import re
+            # Replace single quotes around keys/values with double quotes
+            fixed = re.sub(r"'([^']*)'\s*:", r'"\1":', raw)
+            fixed = re.sub(r':\s*\'([^\']*)\'', r': "\1"', fixed)
+            # Remove trailing commas before closing braces/brackets
+            fixed = re.sub(r',\s*([\]}])', r'\1', fixed)
+            return json.loads(fixed)
+
     except Exception as e:
         raise Exception(f"AI service unavailable. Last error: {str(e)}. Please wait 30 seconds and try again.")
 
