@@ -564,6 +564,31 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
 
 # ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
 HSN_KEYWORDS = [
+    # Tools & Hardware
+    (['wrench', 'spanner', 'pipe wrench'],                                      ('82041110', False)),
+    (['screwdriver', 'screw driver'],                                            ('82054000', False)),
+    (['hammer', 'brick hammer'],                                                 ('82052000', False)),
+    (['trowel', 'masonry trowel', 'jointer'],                                    ('82055990', False)),
+    (['clamp', 'scaffolding clamp', 'saddle clamp'],                             ('73269099', False)),
+    # Safety & Consumables
+    (['helmet', 'safety helmet'],                                                ('65061090', False)),
+    (['gloves', 'cotton hand gloves'],                                           ('61169200', False)),
+    (['tarpaulin', 'waterproof tarpaulin'],                                      ('39269099', False)),
+    (['grout', 'epoxy grout', 'sanded grout'],                                   ('38245090', False)),
+    (['mesh', 'wall plaster mesh'],                                              ('73144990', False)),
+    (['foam', 'pu foam'],                                                        ('39095000', False)),
+    (['paper roll', 'glass paper', 'sandpaper'],                                 ('68052030', False)),
+    (['thread roll', 'nylon thread'],                                            ('54011000', False)),
+    # Paints & Primers
+    (['primer', 'wood primer', 'cement primer'],                                 ('32089090', False)),
+    (['paint', 'aluminum paint', 'distemper'],                                   ('32091090', False)),
+    (['toner', 'stain toner'],                                                   ('32129090', False)),
+    # Plumbing & Valves
+    (['end cap', 'cpvc end cap'],                                                ('39174000', False)),
+    (['check valve', 'brass check valve', 'foot valve'],                         ('84818030', False)),
+    (['spanner', 'diverter', 'shower diverter'],                                 ('84818090', False)),
+    (['sensor', 'flusher', 'urinal flusher'],                                    ('85365020', False)),
+    (['rainwater pipe', 'pvc rain'],                                             ('39172300', False)),
     # Comprehensive Plumbing & Hardware mapping
     (['reducer', 'bush reducer'],                                                ('39174000', False)),
     (['brass threaded tee', 'tee'],                                              ('39174000', False)),
@@ -642,7 +667,7 @@ def detect_hsn_for_items(items):
     """
     Detect HSN/SAC codes for all items:
     1. Local keyword lookup first (instant, 0 tokens).
-    2. Dynamic AI Fallback for any brand-new or unrecognized items.
+    2. Dynamic AI Fallback with strict 8-digit enforcement for any brand-new items.
     """
     if not items:
         return {}
@@ -658,17 +683,18 @@ def detect_hsn_for_items(items):
         else:
             needs_ai.append((i, name))
 
-    # Step 2: If there are brand-new items not in the keyword list, ask AI dynamically!
+    # Step 2: Dynamic AI Lookup for any unknown/brand-new items
     if needs_ai:
         items_numbered = "\n".join([f"{idx+1}. {name}" for idx, (_, name) in enumerate(needs_ai)])
-        prompt = f"""You are an Indian GST expert. For each brand-new item below, provide the correct 8-digit HSN code (for goods) or 6-digit SAC code (for services).
+        prompt = f"""You are an Indian GST expert. For each hardware/electrical/construction item below, provide the correct official Indian GST code.
 
 Items:
 {items_numbered}
 
 Rules:
-1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
-2. Provide the most accurate official Indian GST HSN/SAC code.
+1. Goods MUST have a strict 8-digit HSN code (e.g., paints/primers start with 3208, plumbing pipes/fittings start with 3917 or 7307, valves/cocks start with 8481, tools start with 8204 or 7318, safety gear/gloves/helmets start with 6506 or 3926 or 4015). Never return 7 digits.
+2. Services MUST have a 6-digit SAC code starting with 99.
+3. Avoid generic codes like 85480000 unless absolutely nothing else fits. Find the proper specific chapter code.
 
 Reply ONLY with a valid JSON array, one entry per item, in order:
 [
@@ -677,7 +703,7 @@ Reply ONLY with a valid JSON array, one entry per item, in order:
 Nothing else."""
 
         try:
-            raw = call_ai_with_fallback(prompt, max_tokens=1000)
+            raw = call_ai_with_fallback(prompt, max_tokens=1500)
             
             if '```' in raw:
                 parts = raw.split('```')
@@ -696,19 +722,27 @@ Nothing else."""
                     ai_idx = int(entry.get('item', 0)) - 1
                     if 0 <= ai_idx < len(needs_ai):
                         orig_idx = needs_ai[ai_idx][0]
+                        code = str(entry.get('hsn_or_sac', '')).strip()
+                        
+                        # Pad or correct if AI accidentally returned 7 digits
+                        if len(code) == 7 and code.isdigit():
+                            code += '0'
+                        elif len(code) < 6:
+                            code = '85480000'
+
                         result[orig_idx] = {
-                            'hsn_or_sac': str(entry.get('hsn_or_sac', '85480000')),
+                            'hsn_or_sac': code,
                             'is_service': bool(entry.get('is_service', False))
                         }
         except Exception as e:
             print(f"AI HSN fallback error: {e}")
 
-    # Final safety fallback for any items that completely failed AI lookup
-    for i, name in enumerate(items):
+    # Final safety fallback for any items that completely failed lookup
+    for i, _ in enumerate(items):
         if i not in result:
             result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
 
-    return result  # <--- Properly un-indented outside the loop!
+    return result
     
 _last_seq = {'value': 0}
 
