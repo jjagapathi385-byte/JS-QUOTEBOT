@@ -616,36 +616,44 @@ Reply ONLY with a valid JSON array, one entry per input item, in order:
 
 
 def create_item(name, hsn_code, rate, tax_id, is_service=False):
+    # Fallback to your preferred default if HSN is blank or 999`
+    clean_hsn = str(hsn_code).strip()
+    if not clean_hsn or clean_hsn in ['99999999', '9999999', '']:
+        clean_hsn = '99545900' # Standard 8-digit fallback for general goods/materials
+
     payload = {
         "name": name, "rate": rate,
         "product_type": "service" if is_service else "goods",
-        "hsn_or_sac": str(hsn_code),
+        "hsn_or_sac": clean_hsn,
     }
     if not is_service:
         payload["item_type"] = "inventory"
     if tax_id:
         payload["tax_id"] = tax_id
+        
     r    = zh_post('/items', payload)
     resp = r.json()
     item = resp.get('item', {})
 
     if not item:
-        # Item already exists — fetch it and update HSN if blank
+        # Item already exists — fetch it and check its HSN
         if resp.get('code') == 1001 and 'already exists' in resp.get('message', ''):
             r2       = zh_get('/items', {'search_text': name})
             existing = r2.json().get('items', [])
             if existing:
                 ex_item = existing[0]
-                ex_hsn  = ex_item.get('hsn_or_sac', '').strip().replace('0','')
-                # Update HSN if it's blank or was 00000000
-                if not ex_hsn and hsn_code and str(hsn_code).replace('0',''):
+                ex_hsn  = ex_item.get('hsn_or_sac', '').strip()
+                
+                # FORCE UPDATE: If existing item has a blank, 0, or default 99999999 HSN, update it!
+                if not ex_hsn or ex_hsn in ['99999999', '9999999'] or '0000' in ex_hsn:
                     upd_payload = {
                         "name":         ex_item.get('name', name),
                         "rate":         ex_item.get('rate', rate),
-                        "hsn_or_sac":   str(hsn_code),
+                        "hsn_or_sac":   clean_hsn,
                         "product_type": "service" if is_service else "goods"
                     }
                     zh_put(f'/items/{ex_item["item_id"]}', upd_payload)
+                    ex_item['hsn_or_sac'] = clean_hsn
                 return ex_item
         raise Exception(f"Item creation failed: {resp}")
     return item
@@ -748,8 +756,12 @@ Rules:
    Transformer=85043300, Relay=85364900, Thermostat=90325000,
    Refrigerant gas=38249099, Brazing rod=83112000, Gas torch=84689900,
    Plywood/wood=44121000, Tools/drill=82051000, Safety equip=39262090,
-   Cement=25232900, Cleaning chemical=34029090
-3. If genuinely unsure → HSN 99999999 for goods, SAC 999999 for services.
+   Cement=25232900, Cleaning chemical=34029090, Refrigerator/compressor=841430, 
+   Water pump=841370, Refrigeration parts=841899, PVC pipes=391723, Paints=320890, 
+   Iron/steel bolts=731815, Nuts=731816, Steel bars/rods=721420, Electrical wires/cables=854449,
+   Circuit breakers=853620, Plugs/sockets=853669, Cement=252329, Air conditioner=841510,
+   Rigid plastic pipes=391723, Centrifugal pump parts=841391, freezer=841810
+3. If genuinely unsure → HSN 854800 for goods, SAC 995459 for services.
 
 Reply ONLY with a valid JSON array:
 [
@@ -828,7 +840,7 @@ Reply ONLY with a valid JSON array:
                 if 0 <= ai_idx < len(needs_ai):
                     orig_idx = needs_ai[ai_idx][0]
                     result[orig_idx] = {
-                        'hsn_or_sac': str(entry.get('hsn_or_sac', '99999999')),
+                        'hsn_or_sac': str(entry.get('hsn_or_sac', '99545900')),
                         'is_service':  bool(entry.get('is_service', False))
                     }
             return result
@@ -846,7 +858,7 @@ Reply ONLY with a valid JSON array:
             time.sleep(2)
             continue
 
-    # Groq failed — return what local lookup found, rest get 99999999
+    # Groq failed — return what local lookup found, rest get 854800
     logging.warning(f'detect_hsn_for_items Groq failed: {last_error}')
     return result
 
@@ -2119,7 +2131,7 @@ def quoteform_generate():
 
             # Get HSN/SAC from detection result, fallback to generic
             hsn_info   = hsn_map.get(idx, {})
-            hsn_code   = hsn_info.get('hsn_or_sac', '99999999')
+            hsn_code   = hsn_info.get('hsn_or_sac', '99545900')
             is_service = hsn_info.get('is_service', False)
 
             # Use matched Zoho item or create new one
