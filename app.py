@@ -378,14 +378,14 @@ def extract_store_code(text):
     return None
 
 def find_customer(name, raw_message=None):
-    """Find customer — store code match first, then exact location keyword match, then fallback AI match."""
+    """Find customer — strict store code match first, then strict keyword location match. No blind AI guessing."""
     all_contacts = fetch_all_customers()
     if not all_contacts:
         return None
 
     search_text = f"{name} {raw_message or ''}".upper()
 
-    # ── Step 1: Store code direct match ───────────────────────────────────────
+    # ── Step 1: Store code direct match (100% precise) ───────────────────────
     store_code = extract_store_code(search_text)
     if not store_code and raw_message:
         store_code = extract_store_code(raw_message)
@@ -395,53 +395,60 @@ def find_customer(name, raw_message=None):
             if store_code in cname:
                 return c
 
-    # ── Step 2: Brand detection & filtering ───────────────────────────────────
-    brand = 'KFC' if 'KFC' in search_text else ('PHD' if any(b in search_text for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT']) else None)
-    if not brand and store_code:
-        brand = BRAND_PREFIXES.get(store_code[0])
-    if not brand:
+    # ── Step 2: Full Brand Detection & Strict Filtering ──────────────────────
+    brand = None
+    if 'KFC' in search_text:
         brand = 'KFC'
+    elif any(b in search_text for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
+        brand = 'PHD'
+    elif 'COSTA' in search_text:
+        brand = 'COSTA'
+    elif 'VAANGO' in search_text:
+        brand = 'VAANGO'
+    elif 'PARADISE' in search_text:
+        brand = 'PARADISE'
 
+    # If no brand word in text, check store code prefix if it existed
+    if not brand and store_code:
+        prefix = store_code[0]
+        brand = BRAND_PREFIXES.get(prefix)
+
+    # If NO brand can be identified from the text, DO NOT guess. Return None.
+    if not brand:
+        return None
+
+    # Filter contacts strictly by the detected brand
     if brand == 'KFC':
         filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
     elif brand == 'PHD':
         filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
+    elif brand == 'COSTA':
+        filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
+    elif brand == 'VAANGO':
+        filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
+    elif brand == 'PARADISE':
+        filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
     else:
-        filtered = all_contacts
+        return None
 
     if not filtered:
-        filtered = all_contacts
+        return None
 
     # ── Step 3: Strict Location Keyword Matching ──────────────────────────────
-    # Look for specific location terms in the input (e.g. NIZAMPET, MOOSAPET, etc.)
-    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH'}
+    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND'}
     clean_search = search_text.replace('-', ' ').replace('_', ' ')
     input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 3]
 
-    # Find contact whose name contains the specific location word (e.g., NIZAMPET)
+    # Look for the specific location word (e.g., KOMPALLY) inside the filtered brand contacts
     for c in filtered:
         cname = c.get('contact_name', '').upper()
         if any(word in cname for word in input_words):
             return c
 
-    # ── Step 4: Fallback AI Match ─────────────────────────────────────────────
-    names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(filtered)]
-    names_str  = "\n".join(names_list)
-
-    prompt = f"""Match this store name to the correct customer from the list below.
-Input: "{name}"
-Customers:
-{names_str}
-Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
-
-    try:
-        raw = call_ai_with_fallback(prompt, max_tokens=50)
-        idx = int(''.join(filter(str.isdigit, raw))) - 1
-        if 0 <= idx < len(filtered):
-            return filtered[idx]
-    except Exception:
-        pass
-
+    # ── Step 4: SAFETY SHUTOFF ────────────────────────────────────────────────
+    # If we got here, the brand was recognized (e.g. Paradise), but the specific 
+    # location wasn't found in Zoho. Instead of letting an AI guess a random store,
+    # we return None so it cleanly throws "Customer Not Found".
     return None
 
 def match_all_items(item_names):
