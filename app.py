@@ -378,15 +378,15 @@ def extract_store_code(text):
     return None
 
 def find_customer(name, raw_message=None):
-    """Find customer — store code match first, then deterministic keyword location match, then fallback AI match."""
+    """Find customer — store code match first, then exact location keyword match, then fallback AI match."""
     all_contacts = fetch_all_customers()
     if not all_contacts:
         return None
 
     search_text = f"{name} {raw_message or ''}".upper()
 
-    # ── Step 1: Store code direct match (no AI needed) ───────────────────────
-    store_code = extract_store_code(name)
+    # ── Step 1: Store code direct match ───────────────────────────────────────
+    store_code = extract_store_code(search_text)
     if not store_code and raw_message:
         store_code = extract_store_code(raw_message)
     if store_code:
@@ -396,70 +396,43 @@ def find_customer(name, raw_message=None):
                 return c
 
     # ── Step 2: Brand detection & filtering ───────────────────────────────────
-    brand = None
-    if 'KFC' in search_text:
-        brand = 'KFC'
-    elif any(b in search_text for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
-        brand = 'PHD'
-    elif 'COSTA' in search_text:
-        brand = 'COSTA'
-    elif 'VAANGO' in search_text:
-        brand = 'VAANGO'
-    elif 'PARADISE' in search_text:
-        brand = 'PARADISE'
-
+    brand = 'KFC' if 'KFC' in search_text else ('PHD' if any(b in search_text for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT']) else None)
     if not brand and store_code:
-        prefix = store_code[0]
-        brand = BRAND_PREFIXES.get(prefix)
-
+        brand = BRAND_PREFIXES.get(store_code[0])
     if not brand:
-        brand = 'KFC'  # Default fallback brand
+        brand = 'KFC'
 
-    # Filter customer list by brand
     if brand == 'KFC':
         filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
     elif brand == 'PHD':
         filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
-    elif brand == 'COSTA':
-        filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
-    elif brand == 'VAANGO':
-        filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
-    elif brand == 'PARADISE':
-        filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
     else:
         filtered = all_contacts
 
     if not filtered:
         filtered = all_contacts
 
-    # ── Step 3: Deterministic Location / Keyword Match (Instant, 0 tokens) ───
-    # Extract significant location words (e.g., "MOOSAPET", "KUKATPALLY", "ASRAONAGAR")
-    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND', 'FOR', 'BY'}
+    # ── Step 3: Strict Location Keyword Matching ──────────────────────────────
+    # Look for specific location terms in the input (e.g. NIZAMPET, MOOSAPET, etc.)
+    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH'}
     clean_search = search_text.replace('-', ' ').replace('_', ' ')
-    input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 2]
+    input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 3]
 
-    # Check if any filtered contact name contains these location words
+    # Find contact whose name contains the specific location word (e.g., NIZAMPET)
     for c in filtered:
         cname = c.get('contact_name', '').upper()
-        for word in input_words:
-            if word in cname:
-                return c  # Instant match found locally!
+        if any(word in cname for word in input_words):
+            return c
 
-    # ── Step 4: Fallback AI Match using multi-provider fallback ──────────────
+    # ── Step 4: Fallback AI Match ─────────────────────────────────────────────
     names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(filtered)]
     names_str  = "\n".join(names_list)
 
     prompt = f"""Match this store name to the correct customer from the list below.
-
 Input: "{name}"
-
 Customers:
 {names_str}
-
-Rules:
-1. Match by LOCATION — find the customer whose location words best match the input.
-2. All customers in this list are already the correct brand — just find the right location.
-3. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
+Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
 
     try:
         raw = call_ai_with_fallback(prompt, max_tokens=50)
@@ -576,6 +549,30 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
 # ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
 HSN_KEYWORDS = [
     # Plumbing & Hardware (Added for instant 0-token matching)
+    (['reducer', 'bush reducer'],                                                ('39174000', False)),
+    (['brass threaded tee', 'tee'],                                              ('39174000', False)),
+    (['shower arm', 'arm'],                                                      ('84819090', False)),
+    (['flange cover', 'flange'],                                                 ('39269099', False)),
+    (['drain strainer', 'strainer', 'jali'],                                     ('39269099', False)),
+    (['bottle trap', 'trap'],                                                    ('39249090', False)),
+    (['water tank connector', 'connector'],                                      ('39174000', False)),
+    (['solvent primer', 'primer'],                                               ('32089090', False)),
+    (['pipe clamp', 'clamp'],                                                    ('73269099', False)),
+    (['flexi hose', 'hose pipe'],                                                ('84819090', False)),
+    (['pillar cock', 'tap', 'cock'],                                             ('84818010', False)),
+    (['bib cock'],                                                               ('84818010', False)),
+    (['angle valve', 'stop cock'],                                               ('84818030', False)),
+    (['connection pipe', 'connection hose'],                                     ('84819090', False)),
+    (['ball valve', 'valve'],                                                    ('84818030', False)),
+    (['waste pipe', 'drain pipe'],                                               ('39172300', False)),
+    (['teflon tape', 'thread seal'],                                             ('39199090', False)),
+    (['sink waste', 'coupling', 'waste coupling'],                               ('39269099', False)),
+    (['t bend', 'elbow', 'fitting', 'bends'],                                    ('39174000', False)),
+    (['screw set', 'screw', 'fastener', 'screws'],                               ('73181500', False)),
+    (['wrench', 'spanner', 'tool'],                                              ('82041110', False)),
+    (['nipple', 'extension nipple'],                                             ('73079990', False)),
+    (['hacksaw', 'blade'],                                                       ('82029110', False)),
+    (['wash basin'],
     (['pillar cock', 'tap', 'cock'],                                             ('84818010', False)),
     (['connection pipe', 'hose'],                                                ('84819090', False)),
     (['ball valve', 'valve'],                                                    ('84818030', False)),
@@ -642,23 +639,77 @@ def local_hsn_lookup(item_name):
 
 def detect_hsn_for_items(items):
     """
-    Detect HSN/SAC codes for all items using local keyword lookup first.
-    Completely 0-tokens for all standard plumbing/electrical items.
+    Detect HSN/SAC codes for all items:
+    1. Local keyword lookup first (instant, 0 tokens).
+    2. Dynamic AI Fallback for any brand-new or unrecognized items.
     """
     if not items:
         return {}
 
     result = {}
+    needs_ai = []
+
+    # Step 1: Check local keywords first (Fast & Free)
     for i, name in enumerate(items):
         local = local_hsn_lookup(name)
         if local:
             result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
         else:
-            # Clean generic fallback if local keyword misses
-            result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
-            
-    return result
+            needs_ai.append((i, name))
 
+    # Step 2: If there are brand-new items not in the keyword list, ask AI dynamically!
+    if needs_ai:
+        items_numbered = "\n".join([f"{idx+1}. {name}" for idx, (_, name) in enumerate(needs_ai)])
+        prompt = f"""You are an Indian GST expert. For each brand-new item below, provide the correct 8-digit HSN code (for goods) or 6-digit SAC code (for services).
+
+Items:
+{items_numbered}
+
+Rules:
+1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
+2. Provide the most accurate official Indian GST HSN/SAC code.
+
+Reply ONLY with a valid JSON array, one entry per item, in order:
+[
+  {{"item": 1, "hsn_or_sac": "39174000", "is_service": false}}
+]
+Nothing else."""
+
+        try:
+            # Use your multi-provider fallback (Groq -> Gemini) so it never fails
+            raw = call_ai_with_fallback(prompt, max_tokens=1000)
+            
+            # Clean markdown fences
+            if '```' in raw:
+                parts = raw.split('```')
+                raw = parts[1] if len(parts) > 1 else parts[0]
+                if raw.startswith('json'): raw = raw[4:]
+                raw = raw.strip()
+            
+            if '[' in raw and ']' in raw:
+                start = raw.find('[')
+                end = raw.rfind(']') + 1
+                raw = raw[start:end]
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                for entry in parsed:
+                    ai_idx = int(entry.get('item', 0)) - 1
+                    if 0 <= ai_idx < len(needs_ai):
+                        orig_idx = needs_ai[ai_idx][0]
+                        result[orig_idx] = {
+                            'hsn_or_sac': str(entry.get('hsn_or_sac', '85480000')),
+                            'is_service': bool(entry.get('is_service', False))
+                        }
+        except Exception as e:
+            print(f"AI HSN fallback error: {e}")
+
+    # Final safety fallback for any items that completely failed AI lookup
+    for i, name in enumerate(items):
+        if i not in result:
+            result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
+
+        return result
 
 _last_seq = {'value': 0}
 
