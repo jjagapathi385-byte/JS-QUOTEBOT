@@ -711,8 +711,6 @@ Nothing else."""
 
         return result
 
-_last_seq = {'value': 0}
-
 def get_default_notes():
     """Fetch default customer notes from Zoho estimate settings."""
     try:
