@@ -152,6 +152,66 @@ def zh_put(path, data):
     return requests.put(f'{ZOHO_BASE}{path}', headers=zh(), json=data)
 
 # ── GEMINI PARSE ──────────────────────────────────────────────────────────────
+# ── AI MULTI-PROVIDER HELPER (Groq + Gemini Fallback) ────────────────────────
+def call_ai_with_fallback(prompt, max_tokens=1000):
+    """
+    Tries Groq models first. If rate-limited or fails, 
+    automatically falls back to Google Gemini (free tier).
+    """
+    import time
+    
+    # 1. Try Groq models first
+    groq_models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
+    for model in groq_models:
+        try:
+            r = requests.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {GROQ_KEY}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'model': model,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.1,
+                    'max_tokens': max_tokens
+                },
+                timeout=30
+            )
+            d = r.json()
+            
+            # If successful, return the text content
+            if r.status_code == 200 and 'choices' in d:
+                return d['choices'][0]['message']['content'].strip()
+                
+        except Exception:
+            continue # Try next Groq model or fall through to Gemini
+
+    # 2. Fallback to Google Gemini API (if Groq fails completely or hits 429)
+    if GEMINI_KEY:
+        try:
+            r = requests.post(
+                'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {GEMINI_KEY}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'model': 'gemini-2.5-flash',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.1,
+                    'max_tokens': max_tokens
+                },
+                timeout=30
+            )
+            d = r.json()
+            if r.status_code == 200 and 'choices' in d:
+                return d['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            print(f"Gemini fallback also failed: {e}")
+
+    raise Exception("All AI services (Groq and Gemini fallback) are currently unavailable.")
+    
 def parse_with_gemini(message):
     # Trim message to avoid token limit issues with very long messages
     if len(message) > 3000:
@@ -247,7 +307,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -529,7 +589,7 @@ Reply ONLY with a valid JSON array, one entry per input item, in order:
 
     import time
     import logging
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -713,32 +773,22 @@ def local_hsn_lookup(item_name):
 
 def detect_hsn_for_items(items):
     """
-    Detect HSN/SAC codes for all items.
-    Step 1: Local keyword lookup (instant, no tokens)
-    Step 2: Groq AI call only for items not matched locally
-    Returns: dict keyed by index {0: {hsn_or_sac, is_service}, ...}
+    Detect HSN/SAC codes for all items using local keyword lookup first.
+    Completely bypasses Groq if local rules match, saving tokens.
     """
     if not items:
         return {}
 
-    import time
-    import logging
-    import re as _re
-
-    # ── Step 1: Local keyword lookup for all items ────────────────────────────
-    result       = {}
-    needs_ai     = []   # (original_idx, name) for items not matched locally
-
+    result = {}
     for i, name in enumerate(items):
         local = local_hsn_lookup(name)
         if local:
             result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
         else:
-            needs_ai.append((i, name))
-
-    # If all items matched locally — return immediately, no Groq needed
-    if not needs_ai:
-        return result
+            # Fallback default HSN if local lookup misses (using your preferred code)
+            result[i] = {'hsn_or_sac': '99549000', 'is_service': False}
+            
+    return result
 
     # ── Step 2: Groq call only for unmatched items ────────────────────────────
     items_numbered = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
@@ -768,7 +818,7 @@ Reply ONLY with a valid JSON array:
   {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
     last_error = 'No response received'
 
     for attempt in range(4):
