@@ -378,78 +378,74 @@ def extract_store_code(text):
     return None
 
 def find_customer(name, raw_message=None):
-    """Find customer — store code match first, then brand+location AI match.
-    raw_message: original unparsed message — used to extract store code
-    directly in case AI missed it in the customer name.
-    """
+    """Find customer — store code match first, then deterministic keyword location match, then fallback AI match."""
     all_contacts = fetch_all_customers()
     if not all_contacts:
         return None
 
+    search_text = f"{name} {raw_message or ''}".upper()
+
     # ── Step 1: Store code direct match (no AI needed) ───────────────────────
-    # Try parsed name first, then fall back to raw message
     store_code = extract_store_code(name)
     if not store_code and raw_message:
         store_code = extract_store_code(raw_message)
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
-            # Match store code anywhere in name — end, middle, or exact
-            if (cname.endswith(f'-{store_code}') or
-                f'-{store_code}-' in cname or
-                f'-{store_code}' in cname or
-                cname == store_code):
+            if store_code in cname:
                 return c
-        # Code found in input but no exact match — continue to AI (handles typos)
 
-    # ── Step 2: Brand filter + AI location match ──────────────────────────────
-    name_upper = name.upper()
-
-    # Detect brand from input text
+    # ── Step 2: Brand detection & filtering ───────────────────────────────────
     brand = None
-    if any(b in name_upper for b in ['KFC']):
+    if 'KFC' in search_text:
         brand = 'KFC'
-    elif any(b in name_upper for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
+    elif any(b in search_text for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
         brand = 'PHD'
-    elif 'COSTA' in name_upper:
+    elif 'COSTA' in search_text:
         brand = 'COSTA'
-    elif 'VAANGO' in name_upper:
+    elif 'VAANGO' in search_text:
         brand = 'VAANGO'
-    elif 'PARADISE' in name_upper:
+    elif 'PARADISE' in search_text:
         brand = 'PARADISE'
 
-    # Also detect brand from store code prefix if present
     if not brand and store_code:
         prefix = store_code[0]
-        brand_from_code = BRAND_PREFIXES.get(prefix)
-        if brand_from_code:
-            brand = brand_from_code
+        brand = BRAND_PREFIXES.get(prefix)
 
-    # Filter customer list by brand if detected
-    # If no brand and no store code found → default to KFC (majority of stores)
-    if not brand and not store_code:
-        brand = 'KFC'
+    if not brand:
+        brand = 'KFC'  # Default fallback brand
 
-    if brand:
-        if brand == 'KFC':
-            filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
-        elif brand == 'PHD':
-            filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
-        elif brand == 'COSTA':
-            filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
-        elif brand == 'VAANGO':
-            filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
-        elif brand == 'PARADISE':
-            filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
-        else:
-            filtered = all_contacts
+    # Filter customer list by brand
+    if brand == 'KFC':
+        filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
+    elif brand == 'PHD':
+        filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
+    elif brand == 'COSTA':
+        filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
+    elif brand == 'VAANGO':
+        filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
+    elif brand == 'PARADISE':
+        filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
     else:
         filtered = all_contacts
 
     if not filtered:
-        filtered = all_contacts  # fallback to all if brand filter gives nothing
+        filtered = all_contacts
 
-    # Build numbered list for AI
+    # ── Step 3: Deterministic Location / Keyword Match (Instant, 0 tokens) ───
+    # Extract significant location words (e.g., "MOOSAPET", "KUKATPALLY", "ASRAONAGAR")
+    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND', 'FOR', 'BY'}
+    clean_search = search_text.replace('-', ' ').replace('_', ' ')
+    input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 2]
+
+    # Check if any filtered contact name contains these location words
+    for c in filtered:
+        cname = c.get('contact_name', '').upper()
+        for word in input_words:
+            if word in cname:
+                return c  # Instant match found locally!
+
+    # ── Step 4: Fallback AI Match using multi-provider fallback ──────────────
     names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(filtered)]
     names_str  = "\n".join(names_list)
 
@@ -463,37 +459,16 @@ Customers:
 Rules:
 1. Match by LOCATION — find the customer whose location words best match the input.
 2. All customers in this list are already the correct brand — just find the right location.
-3. Store codes like K589, Y044, S11R29 are in the customer name — if the input has a code, match it exactly.
-4. For location matching — ignore hyphens and abbreviations:
-   "moosapet" matches "MOOSAPET", "balanagar" matches "BALANAGAR",
-   "malkajgiri" matches "MALKAJGIRI", "asraonagar" matches "ASRAO-NAGAR" or "ASRAONAGAR"
-5. Partial location match is acceptable if it's clearly the same place.
-6. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
-
-    r2 = requests.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-        json={
-            'model': 'openai/gpt-oss-120b',
-            'messages': [{'role': 'user', 'content': prompt}],
-            'temperature': 0
-        },
-        timeout=30
-    )
-    try:
-        d2 = r2.json()
-        if 'choices' not in d2 or not d2['choices']:
-            return None
-        result = d2['choices'][0]['message']['content'].strip()
-    except Exception:
-        return None
+3. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
 
     try:
-        idx = int(''.join(filter(str.isdigit, result))) - 1
+        raw = call_ai_with_fallback(prompt, max_tokens=50)
+        idx = int(''.join(filter(str.isdigit, raw))) - 1
         if 0 <= idx < len(filtered):
             return filtered[idx]
     except Exception:
         pass
+
     return None
 
 def match_all_items(item_names):
@@ -935,19 +910,26 @@ def process():
         line_items    = []
         new_items_log = []
 
-        # Match all items against Zoho list in one call
+# Match all items against Zoho list in one call
         item_names_qb  = [item.get('name', '').strip() for item in items if item.get('name', '').strip()]
         item_match_qb  = match_all_items(item_names_qb)
+        
+        # ── RUN LOCAL HSN DETECTION FOR QUOTEBOT ITEMS ────────────────────────
+        hsn_map_qb     = detect_hsn_for_items(item_names_qb)
 
         for idx, item in enumerate(items):
             name         = item.get('name', '').strip()
             qty          = float(item.get('quantity', 1))
             unit_price   = float(item.get('unit_price', 0))
-            # Support both old (hsn_code) and new (hsn_or_sac) field names
-            hsn          = item.get('hsn_or_sac', item.get('hsn_code', ''))
-            is_service   = item.get('is_service', False)
+            
+            # Use local HSN lookup result first, fallback to item parsed value
+            hsn_info     = hsn_map_qb.get(idx, {})
+            hsn          = hsn_info.get('hsn_or_sac', item.get('hsn_or_sac', item.get('hsn_code', '')))
+            is_service   = hsn_info.get('is_service', item.get('is_service', False))
+            
             marked_price = round(unit_price * markup_factor, 2)
-            existing = item_match_qb.get(idx)
+            existing     = item_match_qb.get(idx)
+            
             if existing:
                 item_id = existing['item_id']
             else:
@@ -955,6 +937,7 @@ def process():
                 item_id = created.get('item_id', '')
                 label   = 'SAC' if is_service else 'HSN'
                 new_items_log.append({'name': name, 'hsn': f"{label}: {hsn}" if hsn else 'Auto-assigned', 'rate': marked_price})
+            
             description = item.get('description', '').strip()
             line_items.append({
                 "item_id":     item_id,
