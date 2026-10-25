@@ -1992,7 +1992,6 @@ def quoteform_generate():
         # Detect inter-state GST — handle "36-Telangana" or "Telangana" formats
         TS_STATES = ['telangana', 'ts', '36-telangana']
         state_check = customer_state.lower().strip()
-        # Strip numeric prefix if present (e.g. "36-telangana" → "telangana")
         if '-' in state_check:
             state_check = state_check.split('-', 1)[1].strip()
         is_interstate = state_check not in ['telangana', 'ts'] if state_check else False
@@ -2001,11 +2000,11 @@ def quoteform_generate():
         line_items    = []
         new_items_log = []
 
-        # Detect HSN/SAC for all items in one Groq call
-        item_names  = [item.get('name', '').strip() for item in items_in if item.get('name', '').strip()]
-        hsn_map     = detect_hsn_for_items(item_names)
-
-        # Match all items against Zoho list in one Groq call
+        # Extract item names for HSN & Zoho inventory matching
+        item_names = [item.get('name', '').strip() for item in items_in if item.get('name', '').strip()]
+        
+        # ── SYNC HSN ENGINE WITH QUOTEBOT ─────────────────────────────────────
+        hsn_map        = detect_hsn_for_items(item_names)
         item_match_map = match_all_items(item_names)
 
         for idx, item in enumerate(items_in):
@@ -2015,20 +2014,19 @@ def quoteform_generate():
             if not name or unit_price <= 0:
                 continue
 
-            # Apply 10% markup
+            # Apply 10% markup (or match your QuoteForm standard markup)
             marked_price = round(unit_price * 1.10, 2)
 
-            # Get HSN/SAC from detection result, fallback to generic
+            # Get HSN/SAC from the unified local + AI detector
             hsn_info   = hsn_map.get(idx, {})
             hsn_code   = hsn_info.get('hsn_or_sac', '99545900')
             is_service = hsn_info.get('is_service', False)
 
-            # Use matched Zoho item or create new one
+            # Use matched Zoho item or create new one with the correct HSN
             existing = item_match_map.get(idx)
             if existing:
                 item_id = existing['item_id']
             else:
-                # Create new item with correct HSN/SAC
                 created  = create_item(name, hsn_code, marked_price, tax_id, is_service=is_service)
                 item_id  = created.get('item_id', '')
                 label    = 'SAC' if is_service else 'HSN'
@@ -2045,9 +2043,7 @@ def quoteform_generate():
         if not line_items:
             return jsonify({'status': 'error', 'message': 'No valid items found.'})
 
-        # Notes: save email in notes if provided
         notes = f"Contact Email: {email}" if email else ''
-
         result = create_estimate(customer_id, customer_name, line_items, notes)
         est    = result.get('estimate')
 
@@ -2061,7 +2057,6 @@ def quoteform_generate():
         if email and estimate_id:
             try:
                 email_result = send_estimate_email(estimate_id, email)
-                # Zoho returns code 0 on success
                 email_sent = email_result.get('code', -1) == 0
             except Exception as e:
                 import logging
