@@ -1,2188 +1,280 @@
-from flask import Flask, render_template_string, request, jsonify, session
-import time as _time
-import requests
-import json
 import os
-import webbrowser
-from threading import Timer
+import re
+import json
+import time
+import logging
+from datetime import datetime
+from functools import wraps
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_file, Response
+import requests
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'qb-secret-change-me-2024')
+app.secret_key = os.getenv('SECRET_KEY', 'quotebot-secret-key-change-in-prod')
 
-# ── CREDENTIALS (all from environment variables) ──────────────────────────────
-CLIENT_ID     = os.environ.get('ZOHO_CLIENT_ID', '')
-CLIENT_SECRET = os.environ.get('ZOHO_CLIENT_SECRET', '')
-GEMINI_KEY    = os.environ.get('GEMINI_API_KEY', '')
-GROQ_KEY      = os.environ.get('GROQ_API_KEY', '')
-ZOHO_BASE     = "https://invoice.zoho.in/api/v3"
-TOKEN_FILE    = "zoho_tokens.json"
-PORT          = int(os.environ.get('PORT', 5000))
-IS_RAILWAY    = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_SERVICE_NAME'))
+# -----------------------------------------------------------------------------
+# Configuration & Environment Variables
+# -----------------------------------------------------------------------------
+GROQ_KEY = os.getenv('GROQ_API_KEY', '')
+ZOHO_CLIENT_ID = os.getenv('ZOHO_CLIENT_ID', '')
+ZOHO_CLIENT_SECRET = os.getenv('ZOHO_CLIENT_SECRET', '')
+ZOHO_REFRESH_TOKEN = os.getenv('ZOHO_REFRESH_TOKEN', '')
+ZOHO_ORGANIZATION_ID = os.getenv('ZOHO_ORGANIZATION_ID', '')
+ZOHO_ACCOUNTS_URL = os.getenv('ZOHO_ACCOUNTS_URL', 'https://accounts.zoho.com')
+ZOHO_BASE_URL = os.getenv('ZOHO_BASE_URL', 'https://www.zohoapis.com/invoice/v3')
 
-# ── QUOTEBOT CONFIG ───────────────────────────────────────────────────────────
-QUOTEBOT_PIN        = os.environ.get('QUOTEBOT_PIN', '0000')
-QUOTEBOT_TIMEOUT    = 300  # 5 minutes inactivity in seconds
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-# ── QUOTEFORM CONFIG ──────────────────────────────────────────────────────────
-QUOTEFORM_PIN       = os.environ.get('QUOTEFORM_PIN', '0000')
-QUOTEFORM_TIMEOUT   = 300  # 5 minutes inactivity in seconds
-QUOTEFORM_ENABLED   = os.environ.get('QUOTEFORM_ENABLED', 'true').strip().lower() == 'true'
+QUOTEFORM_PIN = os.getenv('QUOTEFORM_PIN', '1234')
 
-# ── TELEGRAM CONFIG ───────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID    = os.environ.get('TELEGRAM_CHAT_ID', '')
+# Dynamic model selection for Groq
+MODELS_TO_TRY = [
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'llama-3.3-70b-versatile',
+    'llama3-8b-8192'
+]
 
-# ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
-def load_tokens():
-    env_refresh = os.environ.get('ZOHO_REFRESH_TOKEN', '')
-    env_org     = os.environ.get('ZOHO_ORG_ID', '')
-    if env_refresh:
-        return {'refresh_token': env_refresh, 'org_id': env_org}
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_tokens(updates):
-    t = load_tokens()
-    t.update(updates)
-    try:
-        with open(TOKEN_FILE, 'w') as f:
-            json.dump(t, f, indent=2)
-    except Exception:
-        pass
-
-# In-memory token cache to avoid refreshing on every call
-_token_cache = {'access_token': None, 'expires_at': 0}
-
-# ── ZOHO LIST CACHE (10 minutes) ──────────────────────────────────────────────
-# Prevents fetching 400+ customers and 500+ items on every quote creation
-_LIST_CACHE_TTL = 600  # 10 minutes
+# -----------------------------------------------------------------------------
+# In-Memory List Caching (10-Minute TTL)
+# -----------------------------------------------------------------------------
+_LIST_CACHE_TTL = 600
 _list_cache = {
-    'customers': {'data': None, 'ts': 0},
-    'items':     {'data': None, 'ts': 0},
+    'customers': {'ts': 0, 'data': None},
+    'items': {'ts': 0, 'data': None}
 }
 
 def _lc_get(key):
-    entry = _list_cache.get(key, {})
-    if entry.get('data') is not None and (_time.time() - entry['ts']) < _LIST_CACHE_TTL:
-        return entry['data']
+    c = _list_cache.get(key)
+    if c and c['data'] is not None and (time.time() - c['ts'] < _LIST_CACHE_TTL):
+        return c['data']
     return None
 
 def _lc_set(key, data):
-    _list_cache[key] = {'data': data, 'ts': _time.time()}
+    _list_cache[key] = {'ts': time.time(), 'data': data}
 
-def fetch_all_customers():
-    """Fetch all customers from Zoho — cached for 10 minutes."""
-    cached = _lc_get('customers')
-    if cached is not None:
-        return cached
-    contacts = []
-    page = 1
-    while True:
-        r    = zh_get('/contacts', {'contact_type': 'customer', 'page': page, 'per_page': 200})
-        data = r.json()
-        contacts.extend(data.get('contacts', []))
-        if not data.get('page_context', {}).get('has_more_page', False):
-            break
-        page += 1
-    _lc_set('customers', contacts)
-    return contacts
+def invalidate_caches():
+    _list_cache['customers']['ts'] = 0
+    _list_cache['items']['ts'] = 0
 
-def fetch_all_items():
-    """Fetch all items from Zoho — cached for 10 minutes."""
-    cached = _lc_get('items')
-    if cached is not None:
-        return cached
-    items = []
-    page  = 1
-    while True:
-        r    = zh_get('/items', {'page': page, 'per_page': 200})
-        data = r.json()
-        items.extend(data.get('items', []))
-        if not data.get('page_context', {}).get('has_more_page', False):
-            break
-        page += 1
-    _lc_set('items', items)
-    return items
+# -----------------------------------------------------------------------------
+# Zoho OAuth & API Helpers
+# -----------------------------------------------------------------------------
+_zoho_token_cache = {'token': None, 'expires_at': 0}
 
-def get_fresh_token():
-    import time
-    t = load_tokens()
-    if not t.get('refresh_token'):
-        raise Exception("Not connected to Zoho. Please complete setup first.")
+def get_zoho_token():
+    now = time.time()
+    if _zoho_token_cache['token'] and now < _zoho_token_cache['expires_at'] - 60:
+        return _zoho_token_cache['token']
 
-    # Use cached token if still valid (with 60s buffer)
-    if _token_cache['access_token'] and time.time() < _token_cache['expires_at'] - 60:
-        return _token_cache['access_token']
+    url = f"{ZOHO_ACCOUNTS_URL}/oauth/v2/token"
+    params = {
+        'refresh_token': ZOHO_REFRESH_TOKEN,
+        'client_id': ZOHO_CLIENT_ID,
+        'client_secret': ZOHO_CLIENT_SECRET,
+        'grant_type': 'refresh_token'
+    }
+    r = requests.post(url, params=params, timeout=15)
+    data = r.json()
+    if 'access_token' not in data:
+        raise Exception(f"Failed to refresh Zoho token: {data}")
 
-    # Refresh token from Zoho
-    r = requests.post('https://accounts.zoho.in/oauth/v2/token', data={
-        'grant_type':    'refresh_token',
-        'client_id':     CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'refresh_token': t['refresh_token']
-    })
-    d = r.json()
-    if 'access_token' not in d:
-        raise Exception(f"Token refresh failed: {d}")
+    _zoho_token_cache['token'] = data['access_token']
+    _zoho_token_cache['expires_at'] = now + data.get('expires_in', 3600)
+    return _zoho_token_cache['token']
 
-    # Cache it for 55 minutes (Zoho tokens last 1 hour)
-    _token_cache['access_token'] = d['access_token']
-    _token_cache['expires_at']   = time.time() + 3300
-    save_tokens({'access_token': d['access_token']})
-    return d['access_token']
-
-def zh():
-    token  = get_fresh_token()
-    org_id = load_tokens().get('org_id', '')
+def zoho_headers():
+    token = get_zoho_token()
     return {
-        'Authorization': f'Zoho-oauthtoken {token}',
-        'X-com-zoho-invoice-organizationid': org_id,
+        'Authorization': f"Zoho-oauthtoken {token}",
+        'X-Com-Zoho-Invoice-Organizationid': ZOHO_ORGANIZATION_ID,
         'Content-Type': 'application/json'
     }
 
-def zh_get(path, params=None):
-    return requests.get(f'{ZOHO_BASE}{path}', headers=zh(), params=params or {})
-
-def zh_post(path, data):
-    return requests.post(f'{ZOHO_BASE}{path}', headers=zh(), json=data)
-
-def zh_put(path, data):
-    return requests.put(f'{ZOHO_BASE}{path}', headers=zh(), json=data)
-
-# ── GEMINI PARSE ──────────────────────────────────────────────────────────────
-def parse_with_gemini(message):
-    # Trim message to avoid token limit issues with very long messages
-    if len(message) > 3000:
-        message = message[:3000]
-
-    prompt = f"""You are a quotation parser for an Indian hardware/electrical supplies business.
-
-Parse this WhatsApp quotation message and return ONLY a valid JSON object. No markdown, no explanation.
-
-Message:
----
-{message}
----
-
-Rules:
-1. Extract customer/store name from the first line or header.
-   Also extract store code if present (e.g. K318, P380, Z091) — store codes are a letter followed by 3-4 digits.
-   Include store code in customer_name field (e.g. "Ongole Pizza Hut P380").
-2. For each item: name, quantity (default 1), unit_price.
-   - If total price given for multiple qty, divide to get unit_price (e.g. "5nos 1000" → unit=200)
-   - Price may be STUCK to item name with no space — always split it:
-     "scolding7500" → name="Scolding", unit_price=7500
-     "labour charges11000" → name="Labour Charges", unit_price=11000
-     "cement12 bags 7400" → name="Cement", qty=12, unit_price=616
-   - Always separate trailing numbers as price
-   - IMPORTANT: If NO individual prices are given but only a grand total exists:
-     Create ONE single line item. Use the work description as the item name
-     (e.g. "Electrical Work", "AC Repair Work", "Plumbing Work").
-     Set unit_price to the grand total value, qty=1.
-     List all the individual items mentioned as a comma-separated string in the "description" field.
-     Leave notes empty unless there is separate work context.
-     Example: message has "1.Wire 2.Lugs 3.Nuts Total 4000" →
-     item name="Electrical Work", unit_price=4000, qty=1,
-     description="16sq mm Wire, Pin Type Lugs, Nuts and Bolts"
-3. IMPORTANT - Correct item names: fix typos, expand abbreviations, use proper industry names.
-   Examples:
-   - "brazing rad pipe" → "Brazing Rod Pipe"
-   - "let machine work" → "Lathe Machine Work"
-   - "magnitor" → "Magnetron"
-   - "fevi bond" → "Fevibond Adhesive"
-   - "LPG gas tarch" → "LPG Gas Torch"
-   - "R 32 gas" → "R32 Refrigerant Gas"
-   - "led lt" → "LED Light"
-   - "ac servic" → "AC Service"
-   - "scolding" → "Scaffolding"
-   - "Lappam patty" → "Lappam Putty"
-   - "birla white care putty" → "Birla White Care Putty"
-   - "paint roller.1200" → name="Paint Roller", price=1200 (period is separator not decimal)
-   - "paint 15 L litre 6300" → name="Paint", qty=1, unit_price=6300 (15L is description not qty)
-   - Any separator like period(.), dash(-), slash(/) between item and price should be treated as separator
-   Always use proper English, correct spelling, full words.
-4. Assign the most accurate 8-digit HSN code. Common ones:
-   LED lights/lamps=94054090, Tape=39199090, Adhesive/Fevicol/Fevibond=35069900,
-   PVC pipe=39172300, Wire/cable=85444290, Switch/socket=85363010, MCB=85362000,
-   Paint=32089090, Cement=25232900, Steel/iron=72142000, Screws/bolts=73181500,
-   Plywood=44121000, Glass=70051000, Fan=84145100, Pump=84137090,
-   Refrigerant gas=38249099, Lathe/machine work=84589900, Magnetron=85402000,
-   Magnetar/magnet component=85051100, Air counter sensor/air sensor/proximity sensor=85269090,
-   Capacitor=85321000, Diode=85411000, Resistor=85334000, PCB/circuit board=85340000,
-   Transformer=85043300, Relay=85364900, Thermostat=90325000,
-   Brazing rod=83112000, Gas torch=84689900, Service charges=998719
-   For anything else use your best judgment.
-
-Return this exact JSON:
-{{
-  "customer_name": "name here",
-  "is_interstate": false,
-  "email": "email@example.com or empty string if none",
-  "notes": "work description or context only — see rules below",
-  "items": [
-    {{
-      "name": "item name",
-      "quantity": 1,
-      "unit_price": 0.0,
-      "hsn_or_sac": "12345678",
-      "is_service": false,
-      "description": ""
-    }}
-  ]
-}}
-
-For email field: extract email address if found anywhere in the message. Empty string if none.
-For notes field — strict rules:
-INCLUDE in notes:
-- Work description or context (e.g. "AC repair work", "walk in freezer", "glass door side holders assemble work")
-EXCLUDE from notes (set empty string if only these exist):
-- Any total / grand total lines (e.g. "Total 3200", "Total Cost 6500", "Grand Total")
-- "Please share the quotation" or similar share/send requests
-- "Urgent" or similar filler words alone
-- "Send quotation" type phrases
-- Store name or customer name (already captured separately)
-If nothing valid for notes → return empty string "".
-ONLY return the JSON. Nothing else."""
-
-    import time
-    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] 
-    last_error = 'No response received'
-
-    for attempt in range(4):
-        model = models[min(attempt, len(models)-1)]
-        try:
-            r = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {GROQ_KEY}',
-                    'Content-Type': 'application/json'
-                },
-                json={
-                    'model': model,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'temperature': 0.1,
-                    'max_tokens': 2000
-                },
-                timeout=60
-            )
-            d = r.json()
-
-            # Rate limit — wait longer and try next model
-            if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                wait = 10 * (attempt + 1)
-                last_error = f"Rate limited on {model}"
-                time.sleep(wait)
-                continue
-
-            # Model unavailable or any API error — try next model, don't raise
-            if 'error' in d:
-                err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                last_error = f"Model {model} error: {err_msg}"
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d or not d['choices']:
-                last_error = f"No choices from {model}: {str(d)[:200]}"
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = f"Parse error on {model}: {ke}"
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = f"Empty response from {model}"
-                time.sleep(5)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'):
-                    raw = raw[4:]
-                raw = raw.strip()
-
-            return json.loads(raw)
-
-        except json.JSONDecodeError:
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    raise Exception(f"AI service unavailable. Last error: {last_error}. Please wait 30 seconds and try again.")
-
-# ── ZOHO HELPERS ──────────────────────────────────────────────────────────────
-def get_gst18_tax_id():
-    r = zh_get('/taxes')
-    for tax in r.json().get('taxes', []):
-        pct  = tax.get('tax_percentage', 0)
-        name = tax.get('tax_name', '').upper()
-        if pct == 18 or ('18' in name and ('GST' in name or 'CGST' in name)):
-            return tax['tax_id']
-    return None
-
-def get_customer_state(customer):
-    """Extract state from Place of Supply field — more reliable than billing address."""
-    # Try place_of_supply first (e.g. "36-Telangana" or "Telangana")
-    pos = customer.get('place_of_supply', '') or ''
-    if pos:
-        # Strip state code prefix like "36-"
-        if '-' in pos:
-            pos = pos.split('-', 1)[1]
-        return pos.strip()
-    # Fallback to billing address state
-    return customer.get('billing_address', {}).get('state', '')
-
-# Brand prefix → brand name mapping
-BRAND_PREFIXES = {
-    'K': 'KFC', 'Y': 'KFC',
-    'P': 'PHD', 'Z': 'PHD',
-    'C': 'COSTA',
-    'V': 'VAANGO',
-}
-
-def extract_store_code(text):
-    """Extract store code from text. Handles:
-    - Standard codes: K589, Y044, Z091, P287, C499
-    - Paradise codes: S11R29, S11R06, S34R01 etc.
-    """
-    import re
-    # Paradise style: S + digits + R + digits (e.g. S11R29, S34R01)
-    match = re.search(r'\b(S\d{1,2}R\d{2,3})\b', text, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    # Standard style: single letter prefix + 3-4 digits
-    match = re.search(r'\b([KYPZCVkypcvz])(\d{3,4})\b', text)
-    if match:
-        return (match.group(1).upper() + match.group(2)).upper()
-    return None
-
-def find_customer(name, raw_message=None):
-    """Find customer — store code match first, then brand+location AI match.
-    raw_message: original unparsed message — used to extract store code
-    directly in case AI missed it in the customer name.
-    """
-    all_contacts = fetch_all_customers()
-    if not all_contacts:
-        return None
-
-    # ── Step 1: Store code direct match (no AI needed) ───────────────────────
-    # Try parsed name first, then fall back to raw message
-    store_code = extract_store_code(name)
-    if not store_code and raw_message:
-        store_code = extract_store_code(raw_message)
-    if store_code:
-        for c in all_contacts:
-            cname = c.get('contact_name', '').upper()
-            # Match store code anywhere in name — end, middle, or exact
-            if (cname.endswith(f'-{store_code}') or
-                f'-{store_code}-' in cname or
-                f'-{store_code}' in cname or
-                cname == store_code):
-                return c
-        # Code found in input but no exact match — continue to AI (handles typos)
-
-    # ── Step 2: Brand filter + AI location match ──────────────────────────────
-    name_upper = name.upper()
-
-    # Detect brand from input text
-    brand = None
-    if any(b in name_upper for b in ['KFC']):
-        brand = 'KFC'
-    elif any(b in name_upper for b in ['PHD', 'PIZZA HUT', 'PIZZAHUT', 'PH ']):
-        brand = 'PHD'
-    elif 'COSTA' in name_upper:
-        brand = 'COSTA'
-    elif 'VAANGO' in name_upper:
-        brand = 'VAANGO'
-    elif 'PARADISE' in name_upper:
-        brand = 'PARADISE'
-
-    # Also detect brand from store code prefix if present
-    if not brand and store_code:
-        prefix = store_code[0]
-        brand_from_code = BRAND_PREFIXES.get(prefix)
-        if brand_from_code:
-            brand = brand_from_code
-
-    # Filter customer list by brand if detected
-    # If no brand and no store code found → default to KFC (majority of stores)
-    if not brand and not store_code:
-        brand = 'KFC'
-
-    if brand:
-        if brand == 'KFC':
-            filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
-        elif brand == 'PHD':
-            filtered = [c for c in all_contacts if any(b in c.get('contact_name', '').upper() for b in ['PHD', 'PH-', 'PH '])]
-        elif brand == 'COSTA':
-            filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
-        elif brand == 'VAANGO':
-            filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
-        elif brand == 'PARADISE':
-            filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
-        else:
-            filtered = all_contacts
-    else:
-        filtered = all_contacts
-
-    if not filtered:
-        filtered = all_contacts  # fallback to all if brand filter gives nothing
-
-    # Build numbered list for AI
-    names_list = [f"{i+1}. {c['contact_name']}" for i, c in enumerate(filtered)]
-    names_str  = "\n".join(names_list)
-
-    prompt = f"""Match this store name to the correct customer from the list below.
-
-Input: "{name}"
-
-Customers:
-{names_str}
-
-Rules:
-1. Match by LOCATION — find the customer whose location words best match the input.
-2. All customers in this list are already the correct brand — just find the right location.
-3. Store codes like K589, Y044, S11R29 are in the customer name — if the input has a code, match it exactly.
-4. For location matching — ignore hyphens and abbreviations:
-   "moosapet" matches "MOOSAPET", "balanagar" matches "BALANAGAR",
-   "malkajgiri" matches "MALKAJGIRI", "asraonagar" matches "ASRAO-NAGAR" or "ASRAONAGAR"
-5. Partial location match is acceptable if it's clearly the same place.
-6. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
-
-    r2 = requests.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-        json={
-            'model': 'openai/gpt-oss-120b',
-            'messages': [{'role': 'user', 'content': prompt}],
-            'temperature': 0
-        },
-        timeout=30
-    )
-    try:
-        d2 = r2.json()
-        if 'choices' not in d2 or not d2['choices']:
-            return None
-        result = d2['choices'][0]['message']['content'].strip()
-    except Exception:
-        return None
-
-    try:
-        idx = int(''.join(filter(str.isdigit, result))) - 1
-        if 0 <= idx < len(filtered):
-            return filtered[idx]
-    except Exception:
-        pass
-    return None
-
-def match_all_items(item_names):
-    """
-    Fetch Zoho item list ONCE, then match all item names in a single Groq call.
-    Returns dict keyed by 0-based index:
-      {0: zoho_item_dict or None, 1: zoho_item_dict or None, ...}
-    None means no match found — caller should create the item.
-    """
-    if not item_names:
-        return {}
-
-    all_items = fetch_all_items()
-    if not all_items:
-        return {i: None for i in range(len(item_names))}
-
-    zoho_names = "\n".join([f"{i+1}. {itm['name']}" for i, itm in enumerate(all_items)])
-    input_names = "\n".join([f"{i+1}. {name}" for i, name in enumerate(item_names)])
-
-    prompt = f"""Match each input item to the closest item in the Zoho list.
-
-Input items:
-{input_names}
-
-Zoho items:
-{zoho_names}
-
-Rules:
-1. For each input item, find the best matching Zoho item number.
-2. Consider abbreviations, plurals, alternate spellings (e.g. "LED Light" matches "LED Lights").
-3. Only match if similarity is at least 70%. Otherwise use 0.
-4. Each input item gets exactly one result.
-
-Reply ONLY with a valid JSON array, one entry per input item, in order:
-[
-  {{"input": 1, "zoho": 5}},
-  {{"input": 2, "zoho": 0}},
-  {{"input": 3, "zoho": 12}}
-]
-0 means no match found. Nothing else in your response."""
-
-    import time
-    import logging
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
-    last_error = 'No response received'
-
-    for attempt in range(4):
-        model = models[min(attempt, len(models) - 1)]
-        try:
-            r2 = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-                json={
-                    'model':       model,
-                    'messages':    [{'role': 'user', 'content': prompt}],
-                    'temperature': 0,
-                    'max_tokens':  500
-                },
-                timeout=60
-            )
-            d2 = r2.json()
-
-            if r2.status_code == 429 or (isinstance(d2.get('error'), dict) and 'rate' in str(d2['error']).lower()):
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            if 'error' in d2:
-                last_error = str(d2['error'])
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d2 or not d2['choices']:
-                last_error = str(d2)[:200]
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d2['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = str(ke)
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = 'Empty response'
-                time.sleep(3)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw   = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'): raw = raw[4:]
-                raw = raw.strip()
-
-            parsed = json.loads(raw)
-            if not isinstance(parsed, list):
-                last_error = 'Not a list'
-                time.sleep(2)
-                continue
-
-            # Build result dict
-            result = {i: None for i in range(len(item_names))}
-            for entry in parsed:
-                input_idx = int(entry.get('input', 0)) - 1
-                zoho_idx  = int(entry.get('zoho', 0)) - 1
-                if 0 <= input_idx < len(item_names) and 0 <= zoho_idx < len(all_items):
-                    result[input_idx] = all_items[zoho_idx]
-            return result
-
-        except json.JSONDecodeError:
-            last_error = 'JSON decode error'
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            last_error = 'Timeout'
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    logging.warning(f'match_all_items failed after all attempts: {last_error}')
-    # On total failure return None for all — caller will attempt to create
-    return {i: None for i in range(len(item_names))}
-
-
-
-def create_item(name, hsn_code, rate, tax_id, is_service=False):
-    payload = {
-        "name": name, "rate": rate,
-        "product_type": "service" if is_service else "goods",
-        "hsn_or_sac": str(hsn_code),
-    }
-    if not is_service:
-        payload["item_type"] = "inventory"
-    if tax_id:
-        payload["tax_id"] = tax_id
-    r    = zh_post('/items', payload)
-    resp = r.json()
-    item = resp.get('item', {})
-
-    if not item:
-        # Item already exists — fetch it and update HSN if blank
-        if resp.get('code') == 1001 and 'already exists' in resp.get('message', ''):
-            r2       = zh_get('/items', {'search_text': name})
-            existing = r2.json().get('items', [])
-            if existing:
-                ex_item = existing[0]
-                ex_hsn  = ex_item.get('hsn_or_sac', '').strip().replace('0','')
-                # Update HSN if it's blank or was 00000000
-                if not ex_hsn and hsn_code and str(hsn_code).replace('0',''):
-                    upd_payload = {
-                        "name":         ex_item.get('name', name),
-                        "rate":         ex_item.get('rate', rate),
-                        "hsn_or_sac":   str(hsn_code),
-                        "product_type": "service" if is_service else "goods"
-                    }
-                    zh_put(f'/items/{ex_item["item_id"]}', upd_payload)
-                return ex_item
-        raise Exception(f"Item creation failed: {resp}")
-    return item
-
-# ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
-HSN_KEYWORDS = [
-    # Services
-    (['ac ', 'hvac', 'air condition', 'air-condition'],                         ('995463', True)),
-    (['repair', 'maintenance', 'servic'],                                        ('995469', True)),
-    (['concrete', 'rcc'],                                                        ('995454', True)),
-    (['structural steel', 'steel erect'],                                        ('995455', True)),
-    (['masonry', 'brickwork', 'brick work'],                                     ('995456', True)),
-    (['scaffold'],                                                               ('995457', True)),
-    (['special trade', 'construction'],                                          ('995458', True)),
-    (['floor', 'tiling', 'tile'],                                               ('995474', True)),
-    (['building completion', 'finishing'],                                       ('995478', True)),
-    (['machinery repair', 'machine repair'],                                     ('998717', True)),
-    (['equipment repair'],                                                       ('998719', True)),
-    (['labour', 'labor', 'manpower', 'workforce'],                              ('995511', True)),
-    (['cleaning', 'housekeeping'],                                               ('998531', True)),
-    # Refrigeration / HVAC goods
-    (['compressor', 'refriger'],                                                ('84143090', False)),
-    (['compressor part', 'fan part'],                                            ('84149090', False)),
-    (['refrigeration equip'],                                                    ('84189900', False)),
-    (['centrifugal pump', 'pump'],                                               ('84137090', False)),
-    # Electrical goods
-    (['tempe box', 'distribution board', 'db box', 'panel board', 'mcb box'],   ('85371000', False)),
-    (['armoured cable', 'armored cable', 'copper armoured', 'cable'],           ('85444290', False)),
-    (['mcb', 'circuit breaker', 'breaker'],                                     ('85362000', False)),
-    (['wire', 'sq mm'],                                                          ('85444290', False)),
-    (['copper ring lug', 'copper pin', 'lug'],                                  ('85369090', False)),
-    (['switch', 'socket', 'plug'],                                               ('85363010', False)),
-    (['led', 'light', 'lamp', 'bulb', 'fitting'],                               ('94054090', False)),
-    (['fan'],                                                                    ('84145100', False)),
-    # Pipes / fittings
-    (['pvc casing', 'casing box', 'pvc box'],                                   ('39172300', False)),
-    (['pvc pipe', 'conduit'],                                                    ('39172300', False)),
-    (['patti', 'gi strip', 'earth strip'],                                       ('72142000', False)),
-    # Hardware
-    (['screw', 'bolt', 'nut', 'fastener'],                                       ('73181500', False)),
-    # Paint / adhesive
-    (['paint', 'primer', 'putty', 'varnish'],                                   ('32089090', False)),
-    (['tape', 'adhesive', 'fevicol', 'fevibond', 'sealant', 'silicone'],        ('35069900', False)),
-    # Other
-    (['accessory', 'accessories', 'misc', 'sundry', 'consumable'],              ('85389000', False)),
-]
-
-def local_hsn_lookup(item_name):
-    """Keyword-based HSN lookup — instant, no tokens.
-    Returns (hsn_code, is_service) or None if no match.
-    """
-    name_lower = item_name.lower()
-    for keywords, result in HSN_KEYWORDS:
-        if any(kw in name_lower for kw in keywords):
-            return result
-    return None
-
-def detect_hsn_for_items(items):
-    """
-    Detect HSN/SAC codes for all items.
-    Step 1: Local keyword lookup (instant, no tokens)
-    Step 2: Groq AI call only for items not matched locally
-    Returns: dict keyed by index {0: {hsn_or_sac, is_service}, ...}
-    """
-    if not items:
-        return {}
-
-    import time
-    import logging
-    import re as _re
-
-    # ── Step 1: Local keyword lookup for all items ────────────────────────────
-    result       = {}
-    needs_ai     = []   # (original_idx, name) for items not matched locally
-
-    for i, name in enumerate(items):
-        local = local_hsn_lookup(name)
-        if local:
-            result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
-        else:
-            needs_ai.append((i, name))
-
-    # If all items matched locally — return immediately, no Groq needed
-    if not needs_ai:
-        return result
-
-    # ── Step 2: Groq call only for unmatched items ────────────────────────────
-    items_numbered = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
-
-    prompt = f"""You are an Indian GST expert. For each item below, provide the correct HSN code (for goods) or SAC code (for services).
-
-Items:
-{items_numbered}
-
-Rules:
-1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
-2. Common codes:
-   Magnetar/magnet=85051100, Air sensor/counter sensor=85269090,
-   Capacitor=85321000, Diode=85411000, Resistor=85334000,
-   Transformer=85043300, Relay=85364900, Thermostat=90325000,
-   Refrigerant gas=38249099, Brazing rod=83112000, Gas torch=84689900,
-   Plywood/wood=44121000, Tools/drill=82051000, Safety equip=39262090,
-   Cement=25232900, Cleaning chemical=34029090
-3. If genuinely unsure → HSN 99999999 for goods, SAC 999999 for services.
-
-Reply ONLY with a valid JSON array:
-[
-  {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
-]"""
-
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
-    last_error = 'No response received'
-
-    for attempt in range(4):
-        model = models[min(attempt, len(models) - 1)]
-        try:
-            r = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-                json={
-                    'model':       model,
-                    'messages':    [{'role': 'user', 'content': prompt}],
-                    'temperature': 0,
-                    'max_tokens':  1000
-                },
-                timeout=60
-            )
-            d = r.json()
-
-            # Rate limit — wait and retry with next model
-            if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            if 'error' in d:
-                err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                last_error = err_msg
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d or not d['choices']:
-                last_error = str(d)[:200]
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = f"Parse error: {ke}"
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = 'Empty response'
-                time.sleep(3)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw   = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'): raw = raw[4:]
-                raw = raw.strip()
-
-            # If model wrapped array in object — extract it
-            if raw.startswith('{'):
-                arr_match = _re.search(r'\[.*\]', raw, _re.DOTALL)
-                if arr_match:
-                    raw = arr_match.group(0)
-
-            parsed = json.loads(raw)
-            if not isinstance(parsed, list):
-                last_error = 'Response was not a list'
-                time.sleep(2)
-                continue
-
-            # Map Groq results back to original item indices
-            for entry in parsed:
-                ai_idx = int(entry.get('item', 0)) - 1
-                if 0 <= ai_idx < len(needs_ai):
-                    orig_idx = needs_ai[ai_idx][0]
-                    result[orig_idx] = {
-                        'hsn_or_sac': str(entry.get('hsn_or_sac', '99999999')),
-                        'is_service':  bool(entry.get('is_service', False))
-                    }
-            return result
-
-        except json.JSONDecodeError:
-            last_error = 'JSON decode error'
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            last_error = 'Timeout'
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    # Groq failed — return what local lookup found, rest get 99999999
-    logging.warning(f'detect_hsn_for_items Groq failed: {last_error}')
-    return result
-
-
-_last_seq = {'value': 0}
-
-def get_default_notes():
-    """Fetch default customer notes from Zoho estimate settings."""
-    try:
-        r = zh_get('/settings/estimates')
+def fetch_all_customers():
+    cached = _lc_get('customers')
+    if cached is not None:
+        return cached
+
+    url = f"{ZOHO_BASE_URL}/contacts"
+    page = 1
+    all_contacts = []
+    headers = zoho_headers()
+
+    while True:
+        r = requests.get(url, headers=headers, params={'page': page, 'per_page': 200}, timeout=15)
         d = r.json()
-        settings = d.get('estimate_settings', d)
-        return settings.get('notes', '').strip()
-    except Exception:
-        return ''
+        if d.get('code') != 0:
+            break
+        contacts = d.get('contacts', [])
+        all_contacts.extend(contacts)
+        if not d.get('page_context', {}).get('has_more_page', False):
+            break
+        page += 1
 
-def get_next_seq():
-    """Get next seq — combines Zoho scan + in-memory cache."""
+    _lc_set('customers', all_contacts)
+    return all_contacts
+
+def fetch_all_items():
+    cached = _lc_get('items')
+    if cached is not None:
+        return cached
+
+    url = f"{ZOHO_BASE_URL}/items"
+    page = 1
+    all_items = []
+    headers = zoho_headers()
+
+    while True:
+        r = requests.get(url, headers=headers, params={'page': page, 'per_page': 200}, timeout=15)
+        d = r.json()
+        if d.get('code') != 0:
+            break
+        items = d.get('items', [])
+        all_items.extend(items)
+        if not d.get('page_context', {}).get('has_more_page', False):
+            break
+        page += 1
+
+    _lc_set('items', all_items)
+    return all_items
+
+def create_item(name, rate, hsn_or_sac):
+    url = f"{ZOHO_BASE_URL}/items"
+    payload = {
+        'name': name,
+        'rate': float(rate),
+        'product_type': 'goods',
+        'hsn_or_sac': str(hsn_or_sac)
+    }
+    r = requests.post(url, headers=zoho_headers(), json=payload, timeout=15)
+    d = r.json()
+    if d.get('code') == 0:
+        _list_cache['items']['ts'] = 0  # Invalidate item cache on creation
+        return d.get('item')
+    return None
+
+def get_next_estimate_number(customer_name):
+    prefix = "JSINT"
+    m = re.search(r'\((K\d+|P\d+|[A-Z0-9]+)\)', customer_name)
+    store_code = m.group(1) if m else "GEN"
+
+    headers = zoho_headers()
+    url = f"{ZOHO_BASE_URL}/estimates"
+    r = requests.get(url, headers=headers, params={'sort_column': 'created_time', 'sort_order': 'A'}, timeout=15)
+    d = r.json()
+
+    max_seq = 0
+    search_prefix = f"{prefix}-{store_code}-QT-"
+    if d.get('code') == 0:
+        for est in d.get('estimates', []):
+            num = est.get('estimate_number', '')
+            if num.startswith(search_prefix):
+                try:
+                    seq_part = int(num.replace(search_prefix, ''))
+                    if seq_part > max_seq:
+                        max_seq = seq_part
+                except ValueError:
+                    pass
+
+    return f"{search_prefix}{str(max_seq + 1).zfill(6)}"
+
+def send_telegram_notification(msg):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}
     try:
-        r = zh_get('/estimates', {'sort_column': 'created_time', 'sort_order': 'D', 'per_page': 10})
-        estimates = r.json().get('estimates', [])
-        zoho_max = 0
-        for est in estimates:
-            num   = est.get('estimate_number', '')
-            parts = num.split('-')
-            if parts:
-                digits = ''.join(filter(str.isdigit, parts[-1]))
-                if digits:
-                    zoho_max = max(zoho_max, int(digits))
-        max_seq = max(zoho_max, _last_seq['value'])
-        return max_seq + 1 if max_seq > 0 else 1
-    except Exception:
-        return (_last_seq['value'] + 1) if _last_seq['value'] > 0 else 1
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        logging.error(f"Telegram notification error: {e}")
 
-def create_estimate(customer_id, customer_name, line_items, notes=''):
-    """Create estimate with correct number directly — works in both auto and manual Zoho mode."""
-    # Extract last segment of customer name as store code
-    # e.g. "PHD-OGL-GUNT-RD-HYDR-P380" → "P380"
-    # e.g. "KFC-ATTAPUR-HYD-K318" → "K318"
-    parts      = customer_name.strip().upper().split('-')
-    last_seg   = parts[-1].strip().replace(' ', '_') if parts else customer_name.strip().upper()
-    prefix     = f"JSINT-{last_seg}"
+# -----------------------------------------------------------------------------
+# AI Parsing Logic
+# -----------------------------------------------------------------------------
+def call_groq_api(prompt, system_prompt="You are a JSON-only response generator."):
+    headers = {'Authorization': f"Bearer {GROQ_KEY}", 'Content-Type': 'application/json'}
 
-    for attempt in range(5):  # Retry up to 5 times on conflict
-        seq           = get_next_seq() + attempt
-        custom_number = f"{prefix}-QT-{str(seq).zfill(6)}"
-
+    for model in MODELS_TO_TRY:
         payload = {
-            "customer_id":     customer_id,
-            "estimate_number": custom_number,
-            "line_items":      line_items,
+            'model': model,
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': prompt}
+            ],
+            'temperature': 0.1,
+            'max_tokens': 2500
         }
-        # Fetch default Zoho notes and append new note on next line
-        default_note = get_default_notes()
-        if notes and notes.strip():
-            combined = f"{default_note}\n{notes.strip()}" if default_note else notes.strip()
-        else:
-            combined = default_note
-        if combined:
-            payload["notes"] = combined
-
-        r      = zh_post('/estimates', payload)
-        result = r.json()
-
-        if result.get('estimate'):
-            # Success — update seq cache
-            _last_seq['value'] = seq
-            return result
-
-        code = result.get('code', 0)
-        if code == 1001:
-            # Duplicate number — try next
-            _last_seq['value'] = seq
+        try:
+            r = requests.post('https://api.groq.com/openai/v1/chat/completions', headers=headers, json=payload, timeout=30)
+            if r.status_code == 200:
+                res = r.json()
+                return res['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            logging.warning(f"Model {model} failed: {e}")
             continue
-        else:
-            # Other error — return as-is
-            return result
+    raise Exception("All LLM providers failed to generate a response.")
 
-    return result
+# -----------------------------------------------------------------------------
+# Flask Session Helpers
+# -----------------------------------------------------------------------------
+def qf_logged_in():
+    return session.get('qf_auth') is True
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
+def qf_require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not qf_logged_in():
+            return redirect(url_for('quoteform_login'))
+        return f(*args, **kwargs)
+    return decorated
+
+# -----------------------------------------------------------------------------
+# Web Routes
+# -----------------------------------------------------------------------------
 @app.route('/')
 def index():
-    from flask import redirect
-    if not qb_logged_in():
-        return redirect('/qb-login')
-    return render_template_string(HTML)
+    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/qb-login', methods=['GET', 'POST'])
-def qb_login():
-    from flask import redirect
+@app.route('/quoteform/login', methods=['GET', 'POST'])
+def quoteform_login():
+    error = None
     if request.method == 'POST':
         pin = request.form.get('pin', '').strip()
-        if pin == QUOTEBOT_PIN:
-            session['qb_auth'] = True
-            session['qb_last'] = _time.time()
-            return redirect('/')
-        return render_template_string(QUOTEBOT_PIN_HTML, error=True)
-    if qb_logged_in():
-        return redirect('/')
-    expired = request.args.get('expired')
-    return render_template_string(QUOTEBOT_PIN_HTML, error=expired)
-
-@app.route('/status')
-def status():
-    t = load_tokens()
-    configured = bool(t.get('refresh_token'))
-    creds_ok   = bool(CLIENT_ID and CLIENT_SECRET and GROQ_KEY)
-    return jsonify({'configured': configured, 'creds_ok': creds_ok, 'is_railway': IS_RAILWAY})
-
-@app.route('/setup', methods=['POST'])
-def setup():
-    code = request.json.get('auth_code', '').strip()
-    if not code:
-        return jsonify({'success': False, 'error': 'Auth code is empty.'})
-    r = requests.post('https://accounts.zoho.in/oauth/v2/token', data={
-        'grant_type': 'authorization_code',
-        'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET,
-        'redirect_uri': '', 'code': code
-    })
-    d = r.json()
-    if 'refresh_token' not in d:
-        return jsonify({'success': False, 'error': d})
-    save_tokens(d)
-    org_r    = requests.get(f'{ZOHO_BASE}/organizations',
-                            headers={'Authorization': f'Zoho-oauthtoken {d["access_token"]}'})
-    orgs     = org_r.json().get('organizations', [])
-    org_name = 'Unknown'
-    org_id   = ''
-    if orgs:
-        org_id   = orgs[0]['organization_id']
-        org_name = orgs[0].get('name', 'Unknown')
-        save_tokens({'org_id': org_id})
-    return jsonify({
-        'success': True, 'org': org_name,
-        'railway_vars': {
-            'ZOHO_REFRESH_TOKEN': d['refresh_token'],
-            'ZOHO_ORG_ID': org_id
-        }
-    })
-
-@app.route('/next-number')
-def next_number():
-    """Show the next quote number to use for manual creation."""
-    try:
-        # Get last estimate to find current sequence
-        r = zh_get('/estimates', {'sort_column': 'created_time', 'sort_order': 'D', 'per_page': 1})
-        estimates = r.json().get('estimates', [])
-        last_num = 1
-        if estimates:
-            last_no = estimates[0].get('estimate_number', '')
-            digits = ''.join(filter(str.isdigit, last_no.split('-')[-1]))
-            if digits:
-                last_num = int(digits) + 1
-        next_no = str(last_num).zfill(6)
-        return render_template_string("""<!DOCTYPE html><html><head>
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <style>
-          body{font-family:sans-serif;padding:24px;background:#f7f8fc;max-width:400px;margin:0 auto;text-align:center}
-          h2{color:#111;margin-bottom:6px}
-          p{color:#666;font-size:13px;margin-bottom:24px}
-          .num{font-family:monospace;font-size:28px;font-weight:800;color:#4f46e5;background:#eef2ff;padding:20px;border-radius:12px;border:2px solid #c7d2fe;margin-bottom:16px}
-          .format{font-size:13px;color:#6b7280;margin-bottom:20px}
-          button{background:#4f46e5;color:#fff;border:none;border-radius:10px;padding:14px 28px;font-size:15px;font-weight:700;cursor:pointer;width:100%}
-        </style></head><body>
-        <h2>📋 Next Quote Number</h2>
-        <p>Use this sequence number when creating a quote manually in Zoho.</p>
-        <div class="num">{{ next_no }}</div>
-        <div class="format">Format: <strong>JSINT-{STORECODE}-QT-{{ next_no }}</strong><br>e.g. JSINT-K318-QT-{{ next_no }}</div>
-        <button onclick="navigator.clipboard.writeText('{{ next_no }}').then(()=>alert('Copied!'))">Copy Number</button>
-        </body></html>""", next_no=next_no)
-    except Exception as e:
-        return f"<h3 style='font-family:sans-serif;padding:24px'>Error: {e}</h3>"
-
-@app.route('/get-tokens')
-def get_tokens():
-    t = load_tokens()
-    refresh = t.get('refresh_token', '')
-    org_id  = t.get('org_id', '')
-    if not refresh:
-        return "<h2 style='font-family:sans-serif;padding:24px'>No tokens found. Please complete Zoho setup first.</h2>"
-    return render_template_string("""<!DOCTYPE html><html><head>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>
-      body{font-family:sans-serif;padding:24px;background:#f7f8fc;max-width:540px;margin:0 auto}
-      h2{color:#111;margin-bottom:6px}p{color:#666;font-size:13px;margin-bottom:20px}
-      .box{background:#fff;border:1.5px solid #e4e7ef;border-radius:12px;padding:16px;margin-bottom:14px}
-      .label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;margin-bottom:6px}
-      .val{font-family:monospace;font-size:12px;word-break:break-all;color:#111;background:#f3f4f6;padding:10px;border-radius:8px}
-      button{width:100%;background:#4f46e5;color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px}
-    </style></head><body>
-    <h2>🚂 Railway Variables</h2>
-    <p>Copy these two values and add them to Railway → Variables tab. Do this now before redeploying!</p>
-    <div class="box">
-      <div class="label">ZOHO_REFRESH_TOKEN</div>
-      <div class="val" id="r">{{ refresh }}</div>
-      <button onclick="cp('r','ZOHO_REFRESH_TOKEN')">Copy</button>
-    </div>
-    <div class="box">
-      <div class="label">ZOHO_ORG_ID</div>
-      <div class="val" id="o">{{ org_id }}</div>
-      <button onclick="cp('o','ZOHO_ORG_ID')">Copy</button>
-    </div>
-    <script>
-    function cp(id,name){
-      const v=document.getElementById(id).textContent;
-      navigator.clipboard.writeText(v).then(()=>alert(name+' copied!')).catch(()=>{
-        const t=document.createElement('textarea');t.value=v;
-        document.body.appendChild(t);t.select();document.execCommand('copy');
-        document.body.removeChild(t);alert(name+' copied!');
-      });
-    }
-    </script></body></html>""", refresh=refresh, org_id=org_id)
-
-@app.route('/process', methods=['POST'])
-def process():
-    if not qb_logged_in():
-        return jsonify({'status': 'error', 'message': 'Session expired. Please login again.', 'redirect': '/qb-login'})
-    body    = request.json or {}
-    message = body.get('message', '').strip()
-    if not message:
-        return jsonify({'status': 'error', 'message': 'No message provided.'})
-    # Markup: accept from frontend, default 10%
-    try:
-        markup_pct = float(body.get('markup', 10))
-        if markup_pct < 0 or markup_pct > 200:
-            markup_pct = 10
-    except (TypeError, ValueError):
-        markup_pct = 10
-    markup_factor = 1 + markup_pct / 100
-
-    try:
-        parsed        = parse_with_gemini(message)
-        customer_name = parsed.get('customer_name', '').strip()
-        items         = parsed.get('items', [])
-        if not customer_name:
-            return jsonify({'status': 'error', 'message': 'Could not detect customer name.'})
-        # Pass both parsed name AND raw message to find_customer
-        # so store code is extracted from original message if AI missed it
-        customer = find_customer(customer_name, raw_message=message)
-        if not customer:
-            return jsonify({
-                'status': 'customer_not_found',
-                'parsed_name': customer_name,
-                'message': f"Customer '{customer_name}' not found in Zoho Invoice. Please add them first."
-            })
-        # Detect inter-state GST using Place of Supply
-        TS_STATES = ['telangana', 'ts', '36-telangana']
-        cust_state = get_customer_state(customer).lower()
-        is_interstate = cust_state not in TS_STATES if cust_state else False
-        tax_id        = get_gst18_tax_id()
-        line_items    = []
-        new_items_log = []
-
-        # Match all items against Zoho list in one call
-        item_names_qb  = [item.get('name', '').strip() for item in items if item.get('name', '').strip()]
-        item_match_qb  = match_all_items(item_names_qb)
-
-        for idx, item in enumerate(items):
-            name         = item.get('name', '').strip()
-            qty          = float(item.get('quantity', 1))
-            unit_price   = float(item.get('unit_price', 0))
-            # Support both old (hsn_code) and new (hsn_or_sac) field names
-            hsn          = item.get('hsn_or_sac', item.get('hsn_code', ''))
-            is_service   = item.get('is_service', False)
-            marked_price = round(unit_price * markup_factor, 2)
-            existing = item_match_qb.get(idx)
-            if existing:
-                item_id = existing['item_id']
-            else:
-                created = create_item(name, hsn, marked_price, tax_id, is_service)
-                item_id = created.get('item_id', '')
-                label   = 'SAC' if is_service else 'HSN'
-                new_items_log.append({'name': name, 'hsn': f"{label}: {hsn}" if hsn else 'Auto-assigned', 'rate': marked_price})
-            description = item.get('description', '').strip()
-            line_items.append({
-                "item_id":     item_id,
-                "name":        name,
-                "quantity":    qty,
-                "rate":        marked_price,
-                **({"description": description} if description else {}),
-                **({"tax_id": tax_id} if tax_id else {})
-            })
-        notes       = parsed.get('notes', '')
-        email       = parsed.get('email', '').strip()
-        result      = create_estimate(customer['contact_id'], customer.get('contact_name', customer_name), line_items, notes)
-        est         = result.get('estimate')
-        if est:
-            estimate_id = est.get('estimate_id', '')
-            # Send email if found in message
-            email_sent = False
-            if email and estimate_id:
-                try:
-                    import logging
-                    email_result = send_estimate_email(estimate_id, email)
-                    email_sent   = email_result.get('code', -1) == 0
-                except Exception as ex:
-                    import logging
-                    logging.warning(f'QuoteBot email send error: {ex}')
-            return jsonify({
-                'status':          'success',
-                'estimate_number': est.get('estimate_number', 'N/A'),
-                'customer':        customer.get('contact_name', customer_name),
-                'total':           est.get('total', 0),
-                'currency_symbol': est.get('currency_symbol', '₹'),
-                'new_items':       new_items_log,
-                'email_sent':      email_sent,
-                'email':           email
-            })
+        if pin == QUOTEFORM_PIN:
+            session['qf_auth'] = True
+            return redirect(url_for('quoteform_index'))
         else:
-            return jsonify({'status': 'error', 'message': f"Zoho error: {result}"})
-    except json.JSONDecodeError as e:
-        return jsonify({'status': 'error', 'message': f'Parse error: {e}'})
+            error = "Invalid PIN. Please try again."
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+@app.route('/quoteform/logout')
+def quoteform_logout():
+    session.pop('qf_auth', None)
+    return redirect(url_for('quoteform_login'))
+
+@app.route('/quoteform')
+@qf_require_auth
+def quoteform_index():
+    return render_template_string(QUOTEFORM_TEMPLATE)
+
+@app.route('/api/customers')
+def api_customers():
+    try:
+        contacts = fetch_all_customers()
+        cleaned = [{'customer_id': c['contact_id'], 'contact_name': c['contact_name']} for c in contacts]
+        return jsonify({'status': 'success', 'customers': cleaned})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="QuoteBot">
-<title>QuoteBot</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#4F46E5;--accent-h:#4338CA;--green:#059669;--r:14px}
-  html{-webkit-text-size-adjust:100%}
-  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:20px 16px 40px}
-  .shell{width:100%;max-width:520px}
-  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-  .brand{display:flex;align-items:center;gap:10px}
-  .brand-icon{width:38px;height:38px;background:var(--accent);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:19px}
-  .brand-name{font-size:20px;font-weight:800;color:var(--ink);letter-spacing:-.5px}
-  .brand-sub{font-size:11px;color:var(--muted);margin-top:1px}
-  .pill{font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;background:#FEF3C7;color:#92400E;border:1px solid #FCD34D;transition:all .3s;white-space:nowrap}
-  .pill.ok{background:#D1FAE5;color:#065F46;border-color:#6EE7B7}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
-  .card-title{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
-  .setup-steps{background:#EEF2FF;border:1px solid #C7D2FE;border-radius:10px;padding:14px;font-size:13px;color:#3730A3;line-height:1.75;margin-bottom:14px}
-  .setup-steps a{color:#4F46E5;font-weight:600}
-  .setup-steps code{font-family:'JetBrains Mono',monospace;background:#C7D2FE;padding:1px 6px;border-radius:4px;font-size:11px}
-  .input-row{display:flex;gap:8px}
-  input[type=text]{flex:1;border:1.5px solid var(--border);border-radius:10px;padding:11px 13px;font-size:13px;font-family:'JetBrains Mono',monospace;outline:none;transition:border .2s;color:var(--ink);min-width:0}
-  input[type=text]:focus{border-color:var(--accent)}
-  .btn-connect{background:var(--green);color:#fff;border:none;border-radius:10px;padding:11px 16px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;-webkit-tap-highlight-color:transparent}
-  .btn-connect:active{background:#047857}
-  .railway-box{background:#FFF7ED;border:1px solid #FED7AA;border-radius:10px;padding:14px;margin-top:14px;display:none}
-  .railway-box-title{font-size:12px;font-weight:700;color:#C2410C;margin-bottom:10px;text-transform:uppercase;letter-spacing:.04em}
-  .railway-var{background:#fff;border:1px solid #FED7AA;border-radius:8px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
-  .railway-var:active{background:#FFF7ED}
-  .railway-var-label{font-size:10px;font-weight:700;color:#9A3412;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px}
-  .railway-var-val{font-family:'JetBrains Mono',monospace;font-size:11px;color:#1C1917;word-break:break-all}
-  .railway-note{font-size:12px;color:#92400E;line-height:1.6;margin-top:10px}
-  textarea{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:13px;font-size:14px;font-family:'JetBrains Mono',monospace;line-height:1.7;resize:vertical;min-height:150px;outline:none;color:var(--ink);transition:border .2s;-webkit-appearance:none}
-  textarea:focus{border-color:var(--accent)}
-  textarea::placeholder{color:#9CA3AF}
-  .btn-main{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:15px;font-size:15px;font-weight:700;cursor:pointer;margin-top:12px;display:flex;align-items:center;justify-content:center;gap:8px;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
-  .btn-main:active:not(:disabled){background:var(--accent-h)}
-  .btn-main:disabled{background:#9CA3AF;cursor:not-allowed}
-  .loader{display:none;text-align:center;padding:16px 0 4px;color:var(--muted);font-size:13px}
-  .dots span{display:inline-block;width:6px;height:6px;background:var(--accent);border-radius:50%;margin:0 2px;animation:bounce .9s infinite ease-in-out}
-  .dots span:nth-child(2){animation-delay:.15s}
-  .dots span:nth-child(3){animation-delay:.3s}
-  @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
-  .result{display:none;border-radius:10px;padding:16px;margin-top:14px;font-size:14px;line-height:1.7}
-  .result.success{background:#ECFDF5;border:1.5px solid #A7F3D0}
-  .result.warning{background:#FFFBEB;border:1.5px solid #FDE68A}
-  .result.error{background:#FEF2F2;border:1.5px solid #FECACA}
-  .result-title{font-weight:800;font-size:15px;margin-bottom:10px}
-  .result-row{display:flex;align-items:baseline;gap:8px;padding:2px 0;font-size:13px}
-  .rl{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;width:80px;flex-shrink:0}
-  .rv{font-weight:600;color:var(--ink)}
-  .rt{font-size:18px;font-weight:800;color:var(--green)}
-  .new-sec{margin-top:10px;padding-top:10px;border-top:1px solid #A7F3D0}
-  .new-title{font-size:11px;font-weight:700;color:#065F46;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
-  .new-tag{display:inline-flex;align-items:center;gap:5px;background:#fff;border:1px solid #A7F3D0;border-radius:6px;padding:3px 9px;font-size:12px;color:#065F46;font-weight:500;margin:2px}
-  .new-tag .hsn{color:#9CA3AF;font-family:'JetBrains Mono',monospace;font-size:10px}
-  .warn-msg{color:#92400E;font-size:13px;line-height:1.6}
-  .err-msg{color:#7F1D1D;font-size:12px;font-family:'JetBrains Mono',monospace;line-height:1.5;word-break:break-all}
-  .alert-box{background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:14px;font-size:13px;color:#7F1D1D;line-height:1.6;margin-bottom:12px;display:none}
-  .markup-btn{border:1.5px solid var(--border);background:var(--surface);border-radius:8px;padding:7px 16px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;-webkit-tap-highlight-color:transparent;transition:all .15s}
-  .markup-btn:active{background:#F3F4F6}
-  .markup-active{border-color:var(--accent)!important;background:#EEF2FF!important;color:var(--accent)!important}
-</style>
-</head>
-<body>
-<div class="shell">
-  <div class="header">
-    <div class="brand">
-      <div class="brand-icon">⚡</div>
-      <div>
-        <div class="brand-name">QuoteBot</div>
-        <div class="brand-sub">WhatsApp → Zoho Invoice</div>
-      </div>
-    </div>
-    <span class="pill" id="pill">Checking…</span>
-  </div>
-
-  <div class="alert-box" id="creds-alert">
-    ⚠️ <strong>Environment variables missing.</strong><br>
-    Please set <code>ZOHO_CLIENT_ID</code>, <code>ZOHO_CLIENT_SECRET</code>, and <code>GEMINI_API_KEY</code> in Railway Variables.
-  </div>
-
-  <div class="card" id="setup-card" style="display:none">
-    <div class="card-title">🔐 One-time Zoho Setup</div>
-    <div class="setup-steps">
-      1. Go to <a href="https://api-console.zoho.in" target="_blank">api-console.zoho.in</a><br>
-      2. Open <strong>Self Client</strong> → <strong>Generate Code</strong><br>
-      3. Scope: <code>ZohoInvoice.fullaccess.all</code> · Duration: <strong>10 min</strong><br>
-      4. Paste the code below → Connect
-    </div>
-    <div class="input-row">
-      <input type="text" id="auth-input" placeholder="1000.xxxx…" autocomplete="off" autocorrect="off" spellcheck="false"/>
-      <button class="btn-connect" onclick="doSetup()">Connect ✓</button>
-    </div>
-    <div class="railway-box" id="railway-box">
-      <div class="railway-box-title">🚂 Add these to Railway Variables</div>
-      <div class="railway-var" onclick="copyVal('rv-refresh')">
-        <div class="railway-var-label">ZOHO_REFRESH_TOKEN (tap to copy)</div>
-        <div class="railway-var-val" id="rv-refresh">—</div>
-      </div>
-      <div class="railway-var" onclick="copyVal('rv-org')">
-        <div class="railway-var-label">ZOHO_ORG_ID (tap to copy)</div>
-        <div class="railway-var-val" id="rv-org">—</div>
-      </div>
-      <div class="railway-note">Railway dashboard → your service → <strong>Variables</strong> → add both → Redeploy once.</div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">📋 New Quotation</div>
-    <textarea id="msg" placeholder="Paste your WhatsApp message here...
-
-Example:
-AMR store quotation
-1.led lights -200no 3150
-2.3mm tape s 2 no 600
-3.fevi bond -3no 250
-Total = 4000"></textarea>
-    <div style="margin-top:12px">
-      <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px">Markup</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap" id="markup-btns">
-        <button class="markup-btn" data-val="5" onclick="setMarkup(this)">5%</button>
-        <button class="markup-btn" data-val="6" onclick="setMarkup(this)">6%</button>
-        <button class="markup-btn markup-active" data-val="10" onclick="setMarkup(this)">10%</button>
-        <button class="markup-btn" data-val="custom" onclick="setMarkup(this)">Custom</button>
-      </div>
-      <div id="custom-markup-wrap" style="display:none;margin-top:8px">
-        <input type="number" id="custom-markup" placeholder="Enter %" min="0" max="200" step="0.1"
-          style="width:120px;border:1.5px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);-webkit-appearance:none"
-          oninput="this.style.borderColor=this.value?'var(--accent)':'var(--border)'">
-        <span style="font-size:13px;color:var(--muted);margin-left:6px">%</span>
-      </div>
-    </div>
-    <button class="btn-main" id="btn" onclick="processMessage()" style="margin-top:14px">
-      <span>Create Quotation in Zoho</span><span>→</span>
-    </button>
-    <div class="loader" id="loader">
-      <div class="dots"><span></span><span></span><span></span></div>
-      <div style="margin-top:8px">Parsing &amp; creating quotation…</div>
-    </div>
-    <div class="result" id="result"></div>
-  </div>
-</div>
-<script>
-async function checkStatus(){
-  try{
-    const r=await fetch('/status'),d=await r.json();
-    const pill=document.getElementById('pill');
-    const sc=document.getElementById('setup-card');
-    const ca=document.getElementById('creds-alert');
-    const rb=document.getElementById('railway-box');
-    if(!d.creds_ok){ca.style.display='block';pill.textContent='⚠️ Config missing';return}
-    if(d.configured){
-      pill.textContent='✅ Connected';pill.className='pill ok';
-      if(rb && rb.style.display==='block'){sc.style.display='block'}
-      else{sc.style.display='none'}
-    }
-    else{pill.textContent='⚠️ Setup needed';sc.style.display='block'}
-  }catch(e){document.getElementById('pill').textContent='⚠️ Offline'}
-}
-async function doSetup(){
-  const code=document.getElementById('auth-input').value.trim();
-  if(!code){alert('Paste the auth code first.');return}
-  const btn=document.querySelector('.btn-connect');
-  btn.disabled=true;btn.textContent='Connecting…';
-  try{
-    const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_code:code})});
-    const d=await r.json();
-    if(d.success){
-      if(d.railway_vars){
-        document.getElementById('rv-refresh').textContent=d.railway_vars.ZOHO_REFRESH_TOKEN;
-        document.getElementById('rv-org').textContent=d.railway_vars.ZOHO_ORG_ID;
-        document.getElementById('railway-box').style.display='block';
-      }
-      checkStatus();
-    }else{alert('❌ Failed: '+JSON.stringify(d.error,null,2))}
-  }catch(e){alert('Error: '+e.message)}
-  btn.disabled=false;btn.textContent='Connect ✓';
-}
-function copyVal(id){
-  const val=document.getElementById(id).textContent;
-  if(val==='—')return;
-  navigator.clipboard.writeText(val).then(()=>alert('Copied!')).catch(()=>{
-    const ta=document.createElement('textarea');ta.value=val;
-    document.body.appendChild(ta);ta.select();document.execCommand('copy');
-    document.body.removeChild(ta);alert('Copied!');
-  });
-}
-let _activeMarkup=10;
-function setMarkup(el){
-  document.querySelectorAll('.markup-btn').forEach(b=>b.classList.remove('markup-active'));
-  el.classList.add('markup-active');
-  const val=el.dataset.val;
-  document.getElementById('custom-markup-wrap').style.display=(val==='custom'?'block':'none');
-  if(val!=='custom') _activeMarkup=parseFloat(val);
-}
-function getMarkup(){
-  const active=document.querySelector('.markup-active');
-  if(active&&active.dataset.val==='custom'){
-    const v=parseFloat(document.getElementById('custom-markup').value);
-    return isNaN(v)?10:v;
-  }
-  return _activeMarkup;
-}
-async function processMessage(){
-  const msg=document.getElementById('msg').value.trim();
-  if(!msg){alert('Paste a WhatsApp message first.');return}
-  const markup=getMarkup();
-  const btn=document.getElementById('btn'),loader=document.getElementById('loader'),res=document.getElementById('result');
-  btn.disabled=true;loader.style.display='block';res.style.display='none';
-  try{
-    const r=await fetch('/process',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,markup})});
-    const d=await r.json();
-    res.style.display='block';
-    if(d.redirect){
-      window.location.href=d.redirect; return;
-    }
-    if(d.status==='success'){
-      res.className='result success';
-      let ni='';
-      if(d.new_items&&d.new_items.length){
-        const tags=d.new_items.map(i=>`<span class="new-tag">📦 ${i.name} <span class="hsn">${i.hsn}</span></span>`).join('');
-        ni=`<div class="new-sec"><div class="new-title">🆕 New items added to Zoho</div>${tags}</div>`;
-      }
-      const emailRow = d.email ? `<div class="result-row"><span class="rl">Email</span><span class="rv" style="color:${d.email_sent?'#059669':'#DC2626'}">${d.email_sent?'✓ Sent':'✗ Failed'} — ${d.email}</span></div>` : '';
-      res.innerHTML=`<div class="result-title" style="color:#065F46">✅ Quotation Created!</div>
-        <div class="result-row"><span class="rl">Quote No.</span><span class="rv">${d.estimate_number}</span></div>
-        <div class="result-row"><span class="rl">Customer</span><span class="rv">${d.customer}</span></div>
-        <div class="result-row"><span class="rl">Total</span><span class="rt">${d.currency_symbol}${d.total}</span></div>${emailRow}${ni}`;
-    }else if(d.status==='customer_not_found'){
-      res.className='result warning';
-      res.innerHTML=`<div class="result-title" style="color:#92400E">⚠️ Customer Not Found</div>
-        <div class="warn-msg">Detected: <strong>${d.parsed_name}</strong><br>Not in Zoho Invoice. Add the customer first, then try again.</div>`;
-    }else{
-      res.className='result error';
-      res.innerHTML=`<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${d.message}</div>`;
-    }
-  }catch(e){
-    res.style.display='block';res.className='result error';
-    res.innerHTML=`<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${e.message}</div>`;
-  }
-  btn.disabled=false;loader.style.display='none';
-}
-
-// ── Session timeout warning ──
-let _warnTimer, _expireTimer;
-function _resetTimers(){
-  clearTimeout(_warnTimer); clearTimeout(_expireTimer);
-  document.getElementById('qb-timeout-bar').style.display='none';
-  _warnTimer   = setTimeout(()=>{ document.getElementById('qb-timeout-bar').style.display='block'; }, 240000); // warn at 4 min
-  _expireTimer = setTimeout(()=>{ window.location.href='/qb-login?expired=1'; }, 300000); // expire at 5 min
-}
-document.addEventListener('click',   _resetTimers);
-document.addEventListener('input',   _resetTimers);
-document.addEventListener('keydown', _resetTimers);
-_resetTimers();
-
-checkStatus();
-</script>
-<div id="qb-timeout-bar" style="display:none;position:fixed;bottom:0;left:0;right:0;background:#1F2937;color:#fff;font-size:12px;padding:10px 16px;text-align:center;z-index:999">
-  ⏱ Session expiring soon — <a href="/qb-login" style="color:#60A5FA">login again</a>
-</div>
-</body>
-</html>"""
-
-# ── QUOTEBOT PIN HELPERS ──────────────────────────────────────────────────────
-def qb_logged_in():
-    """Check if QuoteBot session is valid and not timed out."""
-    if not session.get('qb_auth'):
-        return False
-    last = session.get('qb_last', 0)
-    if _time.time() - last > QUOTEBOT_TIMEOUT:
-        session.pop('qb_auth', None)
-        session.pop('qb_last', None)
-        return False
-    session['qb_last'] = _time.time()
-    return True
-
-QUOTEBOT_PIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<title>QuoteBot</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#F59E0B;--accent-h:#D97706;--r:14px}
-  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:32px 24px;width:100%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-  .icon{width:48px;height:48px;background:var(--accent);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 20px}
-  h1{font-size:20px;font-weight:800;color:var(--ink);text-align:center;margin-bottom:6px}
-  .sub{font-size:13px;color:var(--muted);text-align:center;margin-bottom:28px}
-  label{display:block;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
-  input[type=password]{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:13px;font-size:18px;text-align:center;letter-spacing:.3em;outline:none;color:var(--ink);transition:border .2s;-webkit-appearance:none}
-  input[type=password]:focus{border-color:var(--accent)}
-  .btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-top:14px;-webkit-tap-highlight-color:transparent}
-  .btn:active{background:var(--accent-h)}
-  .err{background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:10px 14px;font-size:13px;color:#7F1D1D;margin-top:12px;display:none}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">⚡</div>
-  <h1>QuoteBot</h1>
-  <p class="sub">Enter your PIN to continue</p>
-  {% if error %}<div class="err" style="display:block">Incorrect PIN. Try again.</div>{% endif %}
-  <form method="POST" action="/qb-login">
-    <label>PIN</label>
-    <input type="password" name="pin" inputmode="numeric" autocomplete="off" autofocus maxlength="20" placeholder="••••">
-    <button type="submit" class="btn">Continue →</button>
-  </form>
-</div>
-</body>
-</html>"""
-
-# ── QUOTEFORM HELPERS ─────────────────────────────────────────────────────────
-def qf_logged_in():
-    """Check if QuoteForm session is valid and not timed out."""
-    if not session.get('qf_auth'):
-        return False
-    last = session.get('qf_last', 0)
-    if _time.time() - last > QUOTEFORM_TIMEOUT:
-        session.pop('qf_auth', None)
-        session.pop('qf_last', None)
-        return False
-    # Refresh timer on activity
-    session['qf_last'] = _time.time()
-    return True
-
-def get_all_customers():
-    """Fetch all customers from Zoho, return list of {id, name, state}."""
-    all_contacts = fetch_all_customers()
-    result = []
-    for c in all_contacts:
-        # Use Place of Supply for state — more reliable than billing address
-        pos = c.get('place_of_supply', '') or ''
-        if pos and '-' in pos:
-            state = pos.split('-', 1)[1].strip()
-        elif pos:
-            state = pos.strip()
-        else:
-            state = c.get('billing_address', {}).get('state', '')
-        result.append({
-            'id':    c['contact_id'],
-            'name':  c['contact_name'],
-            'state': state
-        })
-    return result
-
-def send_estimate_email(estimate_id, to_email):
-    """Send estimate PDF via Zoho email API."""
-    import logging
-
-    # Step 1 — mark as sent (required by Zoho before emailing)
-    sent_r = requests.post(
-        f'{ZOHO_BASE}/estimates/{estimate_id}/status/sent',
-        headers=zh(),
-        json={}
-    )
-    sent_d = sent_r.json()
-    if sent_d.get('code', 0) not in [0, 'success']:
-        logging.warning(f'Mark as sent response: {sent_d}')
-
-    # Step 3 — send email using Zoho default template
-    # Empty subject/body lets Zoho use the default email template from settings
-    payload = {
-        "to_mail_ids":            [to_email],
-        "send_from_org_email_id": True,
-        "attach_pdf":             True
-    }
-    r = requests.post(
-        f'{ZOHO_BASE}/estimates/{estimate_id}/email',
-        headers=zh(),
-        json=payload
-    )
-    result = r.json()
-    logging.info(f'Email send result for {estimate_id}: {result}')
-    return result
-
-def send_telegram_notification(quote_number, customer_name, created_by):
-    """Send quote creation notification via Telegram bot."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+@app.route('/api/items')
+def api_items():
     try:
-        by_line = f"\n👤 *Created by:* {created_by}" if created_by else ''
-        message = (
-            f"📋 *New Quote Created*\n"
-            f"🔢 *Quote No:* `{quote_number}`\n"
-            f"🏪 *Customer:* {customer_name}"
-            f"{by_line}"
-        )
-        requests.post(
-            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
-            json={
-                'chat_id':    TELEGRAM_CHAT_ID,
-                'text':       message,
-                'parse_mode': 'Markdown'
-            },
-            timeout=10
-        )
-    except Exception:
-        pass  # Never block quote creation due to notification failure
-
-def get_estimate_pdf(estimate_id):
-    """Download estimate PDF bytes from Zoho."""
-    token  = get_fresh_token()
-    org_id = load_tokens().get('org_id', '')
-    headers = {
-        'Authorization': f'Zoho-oauthtoken {token}',
-        'X-com-zoho-invoice-organizationid': org_id,
-    }
-    r = requests.get(
-        f'{ZOHO_BASE}/estimates/{estimate_id}?accept=pdf',
-        headers=headers
-    )
-    if r.status_code == 200 and 'application/pdf' in r.headers.get('Content-Type', ''):
-        return r.content
-    return None
-
-# ── QUOTEFORM ROUTES ──────────────────────────────────────────────────────────
-
-QUOTEFORM_UNAVAILABLE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Quote Form</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Inter',system-ui,sans-serif;background:#F7F8FC;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-  .card{background:#fff;border:1px solid #E4E7EF;border-radius:14px;padding:40px 28px;width:100%;max-width:360px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-  .icon{font-size:40px;margin-bottom:16px}
-  h1{font-size:20px;font-weight:800;color:#111827;margin-bottom:8px}
-  p{font-size:14px;color:#6B7280;line-height:1.6}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">🔒</div>
-  <h1>Quote Form Unavailable</h1>
-  <p>The Quote Form is currently disabled.<br>Please contact your manager for assistance.</p>
-</div>
-</body>
-</html>"""
-
-QUOTEFORM_PIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<title>Quote Form</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#4F46E5;--accent-h:#4338CA;--r:14px}
-  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:32px 24px;width:100%;max-width:360px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-  .icon{width:48px;height:48px;background:var(--accent);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 20px}
-  h1{font-size:20px;font-weight:800;color:var(--ink);text-align:center;margin-bottom:6px}
-  .sub{font-size:13px;color:var(--muted);text-align:center;margin-bottom:28px}
-  label{display:block;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
-  input[type=password]{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:13px;font-size:18px;text-align:center;letter-spacing:.3em;outline:none;color:var(--ink);transition:border .2s;-webkit-appearance:none}
-  input[type=password]:focus{border-color:var(--accent)}
-  .btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:14px;font-size:15px;font-weight:700;cursor:pointer;margin-top:14px;-webkit-tap-highlight-color:transparent}
-  .btn:active{background:var(--accent-h)}
-  .err{background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:10px 14px;font-size:13px;color:#7F1D1D;margin-top:12px;display:none}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">📋</div>
-  <h1>Quote Form</h1>
-  <p class="sub">Enter your PIN to continue</p>
-  {% if error %}<div class="err" style="display:block">Incorrect PIN. Try again.</div>{% endif %}
-  <form method="POST" action="/quoteform/login">
-    <label>PIN</label>
-    <input type="password" name="pin" id="pin" inputmode="numeric" autocomplete="off" autofocus maxlength="20" placeholder="••••">
-    <button type="submit" class="btn">Continue →</button>
-  </form>
-</div>
-</body>
-</html>"""
-
-QUOTEFORM_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Quote Form">
-<title>Quote Form</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#F7F8FC;--surface:#fff;--border:#E4E7EF;--ink:#111827;--muted:#6B7280;--accent:#4F46E5;--accent-h:#4338CA;--green:#059669;--red:#DC2626;--r:14px}
-  html{-webkit-text-size-adjust:100%}
-  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;padding:20px 16px 60px}
-  .shell{width:100%;max-width:560px;margin:0 auto}
-  .header{display:flex;align-items:center;gap:10px;margin-bottom:24px}
-  .brand-icon{width:38px;height:38px;background:var(--accent);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:19px;flex-shrink:0}
-  .brand-name{font-size:20px;font-weight:800;color:var(--ink);letter-spacing:-.5px}
-  .brand-sub{font-size:11px;color:var(--muted)}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
-  .section-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
-  .field{margin-bottom:14px}
-  .field label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:5px}
-  .field input,.field select{width:100%;border:1.5px solid var(--border);border-radius:10px;padding:11px 13px;font-size:14px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);background:var(--surface);transition:border .2s;-webkit-appearance:none}
-  .field input:focus,.field select:focus{border-color:var(--accent)}
-  .field input::placeholder{color:#9CA3AF}
-  /* Items table */
-  .items-header{display:grid;grid-template-columns:1fr 70px 100px 90px 36px;gap:6px;padding:0 2px;margin-bottom:6px}
-  .items-header span{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
-  .item-row{display:grid;grid-template-columns:1fr 70px 100px 90px 36px;gap:6px;margin-bottom:8px;align-items:center}
-  .item-row input{border:1.5px solid var(--border);border-radius:8px;padding:9px 10px;font-size:13px;font-family:'Inter',sans-serif;outline:none;color:var(--ink);width:100%;transition:border .2s;-webkit-appearance:none}
-  .item-row input:focus{border-color:var(--accent)}
-  .item-row input[readonly]{background:#F3F4F6;color:var(--muted);cursor:default}
-  .item-row input::placeholder{color:#9CA3AF}
-  .del-btn{width:32px;height:32px;background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;color:var(--red);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent;flex-shrink:0}
-  .del-btn:active{background:#FEE2E2}
-  .add-row-btn{display:flex;align-items:center;gap:6px;background:none;border:1.5px dashed var(--border);border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;width:100%;margin-top:4px;-webkit-tap-highlight-color:transparent;transition:border .2s,color .2s}
-  .add-row-btn:hover{border-color:var(--accent);color:var(--accent)}
-  /* Submit button */
-  .btn-main{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:15px;font-size:15px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
-  .btn-main:active:not(:disabled){background:var(--accent-h)}
-  .btn-main:disabled{background:#9CA3AF;cursor:not-allowed}
-  /* Loader */
-  .loader{display:none;text-align:center;padding:16px 0;color:var(--muted);font-size:13px}
-  .dots span{display:inline-block;width:6px;height:6px;background:var(--accent);border-radius:50%;margin:0 2px;animation:bounce .9s infinite ease-in-out}
-  .dots span:nth-child(2){animation-delay:.15s}
-  .dots span:nth-child(3){animation-delay:.3s}
-  @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
-  /* Result */
-  .result{display:none;border-radius:12px;padding:18px;margin-top:14px}
-  .result.success{background:#ECFDF5;border:1.5px solid #A7F3D0}
-  .result.error{background:#FEF2F2;border:1.5px solid #FECACA}
-  .result-title{font-weight:800;font-size:15px;margin-bottom:12px}
-  .result-row{display:flex;align-items:baseline;gap:8px;padding:3px 0;font-size:13px}
-  .rl{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;width:80px;flex-shrink:0}
-  .rv{font-weight:600;color:var(--ink)}
-  .rt{font-size:18px;font-weight:800;color:var(--green)}
-  .pdf-btns{display:flex;gap:10px;margin-top:16px}
-  .pdf-btn{flex:1;padding:12px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;border:none;text-align:center;text-decoration:none;display:flex;align-items:center;justify-content:center;gap:6px;-webkit-tap-highlight-color:transparent}
-  .pdf-view{background:#EEF2FF;color:#4F46E5;border:1.5px solid #C7D2FE}
-  .pdf-view:active{background:#E0E7FF}
-  .pdf-dl{background:var(--accent);color:#fff}
-  .pdf-dl:active{background:var(--accent-h)}
-  .err-msg{color:#7F1D1D;font-size:12px;line-height:1.6;word-break:break-word}
-  /* Timeout warning */
-  .timeout-bar{position:fixed;bottom:0;left:0;right:0;background:#1F2937;color:#fff;font-size:12px;padding:10px 16px;text-align:center;display:none;z-index:999}
-  /* Mobile tweaks */
-  @media(max-width:420px){
-    .items-header{grid-template-columns:1fr 52px 86px 76px 32px}
-    .item-row{grid-template-columns:1fr 52px 86px 76px 32px}
-  }
-</style>
-</head>
-<body>
-<div class="shell">
-  <div class="header">
-    <div class="brand-icon">📋</div>
-    <div>
-      <div class="brand-name">Quote Form</div>
-      <div class="brand-sub">Create a Zoho Estimate</div>
-    </div>
-  </div>
-
-  <!-- Customer -->
-  <div class="card">
-    <div class="section-label">Customer</div>
-    <div class="field">
-      <label>Store / Customer Name</label>
-      <input type="text" id="cust-search" placeholder="Type to search..." autocomplete="off" oninput="filterCustomers()" onfocus="showDropdown('')">
-      <div id="cust-dropdown" style="display:none;border:1.5px solid var(--border);border-radius:10px;margin-top:4px;background:#fff;max-height:220px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.08)"></div>
-      <input type="hidden" id="cust-id">
-      <input type="hidden" id="cust-state">
-    </div>
-    <div class="field">
-      <label>Your Name <span style="color:#9CA3AF;font-weight:400">(optional)</span></label>
-      <input type="text" id="created-by" placeholder="e.g. Ravi, Store Manager" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>Contact Email <span style="color:#9CA3AF;font-weight:400">(optional)</span></label>
-      <input type="email" id="cust-email" placeholder="email@example.com" autocomplete="off">
-    </div>
-  </div>
-
-  <!-- Items -->
-  <div class="card">
-    <div class="section-label">Items</div>
-    <div class="items-header">
-      <span>Item Name</span>
-      <span>Qty</span>
-      <span>Unit Price</span>
-      <span>Total</span>
-      <span></span>
-    </div>
-    <div id="items-container"></div>
-    <button type="button" class="add-row-btn" onclick="addRow()">
-      <span style="font-size:18px;line-height:1">+</span> Add Item
-    </button>
-    <div style="margin-top:14px">
-      <div style="font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Or paste a list directly</div>
-      <textarea id="bulk-paste" rows="4" placeholder="Example:
-LED Lights - 10nos - 200
-Paint Roller - 5 - 150
-PVC Pipe - 20nos - 80" style="width:100%;border:1.5px solid var(--border);border-radius:10px;padding:11px 13px;font-size:13px;font-family:'Inter',sans-serif;line-height:1.6;resize:vertical;outline:none;color:var(--ink);-webkit-appearance:none;transition:border .2s" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"></textarea>
-      <button type="button" onclick="parseBulk()" style="margin-top:8px;background:#EEF2FF;color:var(--accent);border:1.5px solid #C7D2FE;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:700;cursor:pointer;-webkit-tap-highlight-color:transparent" id="bulk-btn">Parse &amp; Add Items</button>
-      <div id="bulk-status" style="font-size:12px;margin-top:6px;display:none"></div>
-    </div>
-  </div>
-
-  <!-- Submit -->
-  <div class="card" style="padding:16px">
-    <button type="button" class="btn-main" id="submit-btn" onclick="submitForm()">
-      <span>Generate Quote</span><span>→</span>
-    </button>
-    <div class="loader" id="loader">
-      <div class="dots"><span></span><span></span><span></span></div>
-      <div style="margin-top:8px">Creating estimate in Zoho…</div>
-    </div>
-    <div class="result" id="result"></div>
-  </div>
-</div>
-
-<div class="timeout-bar" id="timeout-bar">⏱ Session expiring soon — submit your quote or <a href="/quoteform" style="color:#60A5FA">refresh</a></div>
-
-<script>
-// ── Customer data ──
-const customers = {{ customers_list | tojson }};
-let selectedCustomer = null;
-
-function filterCustomers(){
-  const q = document.getElementById('cust-search').value.trim().toLowerCase();
-  showDropdown(q);
-  // Clear selection if user types again
-  document.getElementById('cust-id').value = '';
-  document.getElementById('cust-state').value = '';
-  selectedCustomer = null;
-}
-
-function showDropdown(q){
-  const dd = document.getElementById('cust-dropdown');
-  const search = (q !== undefined && q !== null) ? q : document.getElementById('cust-search').value.trim().toLowerCase();
-  const filtered = search.length === 0
-    ? customers.slice(0, 50)
-    : customers.filter(c => c.name.toLowerCase().includes(search));
-
-  if(!filtered.length){ dd.style.display='none'; return; }
-
-  // Store data on elements to avoid quote-escaping issues in onclick
-  dd.innerHTML = '';
-  filtered.forEach((c, i) => {
-    const div = document.createElement('div');
-    div.style.cssText = 'padding:10px 14px;cursor:pointer;font-size:14px;border-bottom:1px solid #F3F4F6;color:#111827';
-    div.innerHTML = c.name + (c.state ? `<span style="font-size:11px;color:#6B7280;margin-left:6px">${c.state}</span>` : '');
-    div.addEventListener('mouseenter', () => div.style.background = '#F9FAFB');
-    div.addEventListener('mouseleave', () => div.style.background = '');
-    div.addEventListener('click', () => selectCustomer(c.id, c.name, c.state || ''));
-    dd.appendChild(div);
-  });
-  dd.style.display = 'block';
-}
-
-function selectCustomer(id, name, state){
-  document.getElementById('cust-search').value = name;
-  document.getElementById('cust-id').value = id;
-  document.getElementById('cust-state').value = state;
-  document.getElementById('cust-dropdown').style.display = 'none';
-  selectedCustomer = {id, name, state};
-}
-
-document.addEventListener('click', e => {
-  const search = document.getElementById('cust-search');
-  const dd = document.getElementById('cust-dropdown');
-  if(search && dd && !search.contains(e.target) && !dd.contains(e.target))
-    dd.style.display = 'none';
-});
-
-// ── Items ──
-let rowCount = 0;
-
-function addRow(){
-  rowCount++;
-  const id = rowCount;
-  const row = document.createElement('div');
-  row.className = 'item-row';
-  row.id = `row-${id}`;
-  row.innerHTML = `
-    <input type="text" placeholder="Item name" id="name-${id}">
-    <input type="number" placeholder="1" min="0" step="any" id="qty-${id}" oninput="calcTotal(${id})">
-    <input type="number" placeholder="0.00" min="0" step="any" id="unit-${id}" oninput="calcFromUnit(${id})">
-    <input type="number" placeholder="0.00" min="0" step="any" id="total-${id}" oninput="calcFromTotal(${id})">
-    <button type="button" class="del-btn" onclick="removeRow(${id})">×</button>`;
-  document.getElementById('items-container').appendChild(row);
-}
-
-function calcFromUnit(id){
-  const qty   = parseFloat(document.getElementById(`qty-${id}`).value) || 0;
-  const unit  = parseFloat(document.getElementById(`unit-${id}`).value) || 0;
-  const total = document.getElementById(`total-${id}`);
-  if(qty && unit){ total.value = (qty * unit).toFixed(2); total.setAttribute('readonly',''); }
-  else { total.removeAttribute('readonly'); total.value = ''; }
-}
-
-function calcFromTotal(id){
-  const qty   = parseFloat(document.getElementById(`qty-${id}`).value) || 0;
-  const tot   = parseFloat(document.getElementById(`total-${id}`).value) || 0;
-  const unit  = document.getElementById(`unit-${id}`);
-  if(qty && tot){ unit.value = (tot / qty).toFixed(2); unit.setAttribute('readonly',''); }
-  else { unit.removeAttribute('readonly'); unit.value = ''; }
-}
-
-function calcTotal(id){
-  // Recalculate whichever direction was active
-  const unitEl  = document.getElementById(`unit-${id}`);
-  const totalEl = document.getElementById(`total-${id}`);
-  if(!unitEl.hasAttribute('readonly')) calcFromUnit(id);
-  else calcFromTotal(id);
-}
-
-function removeRow(id){
-  const el = document.getElementById(`row-${id}`);
-  if(el) el.remove();
-}
-
-async function parseBulk(){
-  const text = document.getElementById('bulk-paste').value.trim();
-  if(!text){ alert('Paste some items first.'); return; }
-  const btn    = document.getElementById('bulk-btn');
-  const status = document.getElementById('bulk-status');
-  btn.disabled = true;
-  btn.textContent = 'Parsing…';
-  status.style.display = 'none';
-  try{
-    const r = await fetch('/quoteform/parse-items', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({text})
-    });
-    const d = await r.json();
-    if(d.status === 'session_expired'){
-      status.style.cssText = 'display:block;color:#DC2626';
-      status.textContent = 'Session expired. Please login again.';
-    } else if(d.status === 'success' && d.items.length){
-      d.items.forEach(item => {
-        addRow();
-        const id = rowCount;
-        document.getElementById(`name-${id}`).value  = item.name || '';
-        document.getElementById(`qty-${id}`).value   = item.quantity || 1;
-        document.getElementById(`unit-${id}`).value  = item.unit_price || '';
-        if(item.quantity && item.unit_price){
-          document.getElementById(`total-${id}`).value = (item.quantity * item.unit_price).toFixed(2);
-          document.getElementById(`total-${id}`).setAttribute('readonly','');
-        }
-      });
-      document.getElementById('bulk-paste').value = '';
-      status.style.cssText = 'display:block;color:#059669';
-      status.textContent = `✓ ${d.items.length} item${d.items.length>1?'s':''} added`;
-    } else {
-      status.style.cssText = 'display:block;color:#DC2626';
-      status.textContent = d.message || 'Could not parse items. Check format and try again.';
-    }
-  } catch(e){
-    status.style.cssText = 'display:block;color:#DC2626';
-    status.textContent = 'Error: ' + e.message;
-  }
-  btn.disabled = false;
-  btn.textContent = 'Parse & Add Items';
-}
-
-function getItems(){
-  const rows = document.querySelectorAll('.item-row');
-  const items = [];
-  rows.forEach(row => {
-    const id = row.id.replace('row-','');
-    const name  = (document.getElementById(`name-${id}`)?.value || '').trim();
-    const qty   = parseFloat(document.getElementById(`qty-${id}`)?.value) || 1;
-    const unit  = parseFloat(document.getElementById(`unit-${id}`)?.value) || 0;
-    if(name && unit > 0) items.push({name, quantity: qty, unit_price: unit});
-  });
-  return items;
-}
-
-// ── Submit ──
-async function submitForm(){
-  const custId    = document.getElementById('cust-id').value;
-  const custName  = document.getElementById('cust-search').value.trim();
-  const custState = document.getElementById('cust-state').value;
-  const email     = document.getElementById('cust-email').value.trim();
-  const createdBy = document.getElementById('created-by').value.trim();
-  const items     = getItems();
-
-  if(!custId){ alert('Please select a customer from the list.'); return; }
-  if(!items.length){ alert('Please add at least one item with a name and price.'); return; }
-
-  const btn    = document.getElementById('submit-btn');
-  const loader = document.getElementById('loader');
-  const result = document.getElementById('result');
-  btn.disabled = true;
-  loader.style.display = 'block';
-  result.style.display = 'none';
-
-  try{
-    const r = await fetch('/quoteform/generate', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({customer_id: custId, customer_name: custName, customer_state: custState, email, created_by: createdBy, items})
-    });
-    const d = await r.json();
-    result.style.display = 'block';
-
-    if(d.status === 'session_expired'){
-      result.className = 'result error';
-      result.innerHTML = '<div class="result-title" style="color:#7F1D1D">⏱ Session Expired</div><div class="err-msg">Your session has expired. <a href="/quoteform">Login again</a></div>';
-    } else if(d.status === 'success'){
-      result.className = 'result success';
-      result.innerHTML = `
-        <div class="result-title" style="color:#065F46">✅ Quote Created</div>
-        <div class="result-row"><span class="rl">Quote No.</span><span class="rv">${d.estimate_number}</span></div>
-        <div class="result-row"><span class="rl">Customer</span><span class="rv">${d.customer}</span></div>
-        <div class="result-row"><span class="rl">Total</span><span class="rt">₹${d.total}</span></div>
-        ${d.email_sent ? '<div class="result-row"><span class="rl">Email</span><span class="rv" style="color:#059669">✓ Sent</span></div>' : ''}
-        <div class="pdf-btns">
-          <a href="/quoteform/pdf/${d.estimate_id}?view=1&name=${encodeURIComponent(d.estimate_number)}" target="_blank" class="pdf-btn pdf-view">👁 View PDF</a>
-          <a href="/quoteform/pdf/${d.estimate_id}?name=${encodeURIComponent(d.estimate_number)}" class="pdf-btn pdf-dl">⬇ Download</a>
-        </div>`;
-    } else {
-      result.className = 'result error';
-      result.innerHTML = `<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${d.message}</div>`;
-    }
-  } catch(e){
-    result.style.display = 'block';
-    result.className = 'result error';
-    result.innerHTML = `<div class="result-title" style="color:#7F1D1D">❌ Error</div><div class="err-msg">${e.message}</div>`;
-  }
-  btn.disabled = false;
-  loader.style.display = 'none';
-}
-
-// ── Session timeout warning ──
-let warnTimer, expireTimer;
-function resetTimers(){
-  clearTimeout(warnTimer); clearTimeout(expireTimer);
-  document.getElementById('timeout-bar').style.display = 'none';
-  warnTimer   = setTimeout(() => { document.getElementById('timeout-bar').style.display = 'block'; }, {{ warn_ms }});
-  expireTimer = setTimeout(() => { window.location.href = '/quoteform?expired=1'; }, {{ timeout_ms }});
-}
-document.addEventListener('click',  resetTimers);
-document.addEventListener('input',  resetTimers);
-document.addEventListener('keydown', resetTimers);
-resetTimers();
-
-// Start with one empty row
-addRow();
-</script>
-</body>
-</html>"""
-
-@app.route('/quoteform')
-def quoteform_login_page():
-    from flask import redirect
-    if not QUOTEFORM_ENABLED:
-        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
-    if qf_logged_in():
-        return redirect('/quoteform/create')
-    expired = request.args.get('expired')
-    return render_template_string(QUOTEFORM_PIN_HTML, error=expired)
-
-@app.route('/quoteform/login', methods=['POST'])
-def quoteform_login():
-    from flask import redirect
-    if not QUOTEFORM_ENABLED:
-        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
-    pin = request.form.get('pin', '').strip()
-    if pin == QUOTEFORM_PIN:
-        session['qf_auth'] = True
-        session['qf_last'] = _time.time()
-        return redirect('/quoteform/create')
-    return render_template_string(QUOTEFORM_PIN_HTML, error=True)
-
-@app.route('/quoteform/create')
-def quoteform_create():
-    from flask import redirect
-    if not QUOTEFORM_ENABLED:
-        return render_template_string(QUOTEFORM_UNAVAILABLE_HTML)
-    if not qf_logged_in():
-        return redirect('/quoteform')
-    customers = get_all_customers()
-    warn_ms    = int((QUOTEFORM_TIMEOUT - 60) * 1000)
-    timeout_ms = int(QUOTEFORM_TIMEOUT * 1000)
-    return render_template_string(
-        QUOTEFORM_HTML,
-        customers_list=customers,
-        warn_ms=warn_ms,
-        timeout_ms=timeout_ms
-    )
-
-@app.route('/quoteform/generate', methods=['POST'])
-def quoteform_generate():
-    if not qf_logged_in():
-        return jsonify({'status': 'session_expired'})
-
-    data          = request.json or {}
-    customer_id   = data.get('customer_id', '').strip()
-    customer_name = data.get('customer_name', '').strip()
-    customer_state= data.get('customer_state', '').strip()
-    email         = data.get('email', '').strip()
-    created_by    = data.get('created_by', '').strip()
-    items_in      = data.get('items', [])
-
-    if not customer_id or not items_in:
-        return jsonify({'status': 'error', 'message': 'Missing customer or items.'})
-
-    try:
-        # Detect inter-state GST — handle "36-Telangana" or "Telangana" formats
-        TS_STATES = ['telangana', 'ts', '36-telangana']
-        state_check = customer_state.lower().strip()
-        # Strip numeric prefix if present (e.g. "36-telangana" → "telangana")
-        if '-' in state_check:
-            state_check = state_check.split('-', 1)[1].strip()
-        is_interstate = state_check not in ['telangana', 'ts'] if state_check else False
-
-        tax_id        = get_gst18_tax_id()
-        line_items    = []
-        new_items_log = []
-
-        # Detect HSN/SAC for all items in one Groq call
-        item_names  = [item.get('name', '').strip() for item in items_in if item.get('name', '').strip()]
-        hsn_map     = detect_hsn_for_items(item_names)
-
-        # Match all items against Zoho list in one Groq call
-        item_match_map = match_all_items(item_names)
-
-        for idx, item in enumerate(items_in):
-            name       = item.get('name', '').strip()
-            qty        = float(item.get('quantity', 1))
-            unit_price = float(item.get('unit_price', 0))
-            if not name or unit_price <= 0:
-                continue
-
-            # Apply 10% markup
-            marked_price = round(unit_price * 1.10, 2)
-
-            # Get HSN/SAC from detection result, fallback to generic
-            hsn_info   = hsn_map.get(idx, {})
-            hsn_code   = hsn_info.get('hsn_or_sac', '99999999')
-            is_service = hsn_info.get('is_service', False)
-
-            # Use matched Zoho item or create new one
-            existing = item_match_map.get(idx)
-            if existing:
-                item_id = existing['item_id']
-            else:
-                # Create new item with correct HSN/SAC
-                created  = create_item(name, hsn_code, marked_price, tax_id, is_service=is_service)
-                item_id  = created.get('item_id', '')
-                label    = 'SAC' if is_service else 'HSN'
-                new_items_log.append({'name': name, 'hsn': f"{label}: {hsn_code}", 'rate': marked_price})
-
-            line_items.append({
-                "item_id":  item_id,
-                "name":     name,
-                "quantity": qty,
-                "rate":     marked_price,
-                **({"tax_id": tax_id} if tax_id else {})
-            })
-
-        if not line_items:
-            return jsonify({'status': 'error', 'message': 'No valid items found.'})
-
-        # Notes: save email in notes if provided
-        notes = f"Contact Email: {email}" if email else ''
-
-        result = create_estimate(customer_id, customer_name, line_items, notes)
-        est    = result.get('estimate')
-
-        if not est:
-            return jsonify({'status': 'error', 'message': f'Zoho error: {result}'})
-
-        estimate_id = est.get('estimate_id', '')
-
-        # Send email via Zoho if provided
-        email_sent = False
-        if email and estimate_id:
-            try:
-                email_result = send_estimate_email(estimate_id, email)
-                # Zoho returns code 0 on success
-                email_sent = email_result.get('code', -1) == 0
-            except Exception as e:
-                import logging
-                logging.warning(f'Email send exception: {e}')
-
-        # Send Telegram notification
-        send_telegram_notification(
-            quote_number  = est.get('estimate_number', 'N/A'),
-            customer_name = customer_name,
-            created_by    = created_by
-        )
-
-        return jsonify({
-            'status':          'success',
-            'estimate_number': est.get('estimate_number', 'N/A'),
-            'estimate_id':     estimate_id,
-            'customer':        customer_name,
-            'total':           est.get('total', 0),
-            'email_sent':      email_sent,
-            'new_items':       new_items_log
-        })
-
+        items = fetch_all_items()
+        cleaned = [{'item_id': i['item_id'], 'name': i['name'], 'rate': i.get('rate', 0), 'hsn_or_sac': i.get('hsn_or_sac', '')} for i in items]
+        return jsonify({'status': 'success', 'items': cleaned})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
@@ -2193,6 +285,7 @@ def quoteform_parse_items():
     text = (request.json or {}).get('text', '').strip()
     if not text:
         return jsonify({'status': 'error', 'message': 'No text provided.'})
+
     try:
         prompt = f"""Parse this item list and return ONLY a valid JSON array. No markdown, no explanation.
 
@@ -2207,10 +300,9 @@ Rules:
 5. Fix typos and abbreviations in item names (proper English).
 6. Ignore any lines that are clearly not items (headers, totals, blank lines).
 
-Return ONLY this JSON array:
+Return ONLY this exact JSON array format:
 [
-  {{"name": "Item Name", "quantity": 1, "unit_price": 0.0}},
-  ...
+  {{"name": "Item Name", "quantity": 1, "unit_price": 0.0}}
 ]
 
 ONLY return the JSON array. Nothing else."""
@@ -2222,58 +314,304 @@ ONLY return the JSON array. Nothing else."""
                 'model': 'openai/gpt-oss-120b',
                 'messages': [{'role': 'user', 'content': prompt}],
                 'temperature': 0.1,
-                'max_tokens': 1000
+                'max_tokens': 2000
             },
             timeout=30
         )
         d = r.json()
+
+        if 'choices' not in d or not d['choices']:
+            return jsonify({'status': 'error', 'message': f'AI service error: {d}'})
+
         raw = d['choices'][0]['message']['content'].strip()
+
+        # Markdown fence extraction
         if '```' in raw:
             parts = raw.split('```')
-            raw = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith('json'): raw = raw[4:]
-            raw = raw.strip()
+            for p in parts:
+                p_clean = p.strip()
+                if p_clean.startswith('json'):
+                    p_clean = p_clean[4:].strip()
+                if p_clean.startswith('[') and p_clean.endswith(']'):
+                    raw = p_clean
+                    break
+
+        # Boundary extraction for array brackets
+        if '[' in raw and ']' in raw:
+            start = raw.find('[')
+            end = raw.rfind(']') + 1
+            raw = raw[start:end]
+
         items = json.loads(raw)
         if not isinstance(items, list):
-            raise ValueError('Expected a list')
+            raise ValueError('Parsed output was not a JSON list')
+
         return jsonify({'status': 'success', 'items': items})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Parse error: {str(e)}'})
+
+@app.route('/quoteform/submit', methods=['POST'])
+def quoteform_submit():
+    if not qf_logged_in():
+        return jsonify({'status': 'session_expired'})
+
+    data = request.json or {}
+    customer_id = data.get('customer_id')
+    customer_name = data.get('customer_name', 'Customer')
+    items = data.get('items', [])
+    markup = float(data.get('markup', 0))
+
+    if not customer_id or not items:
+        return jsonify({'status': 'error', 'message': 'Customer and at least one item are required.'})
+
+    try:
+        all_zoho_items = fetch_all_items()
+        item_map = {i['name'].lower(): i for i in all_zoho_items}
+
+        line_items = []
+        for it in items:
+            name = it['name'].strip()
+            qty = float(it.get('quantity', 1))
+            unit_price = float(it.get('unit_price', 0))
+            if markup > 0:
+                unit_price = round(unit_price * (1 + markup / 100.0), 2)
+
+            z_item = item_map.get(name.lower())
+            if not z_item:
+                z_item = create_item(name, unit_price, "8481")  # Default HSN
+
+            line_items.append({
+                'item_id': z_item['item_id'] if z_item else None,
+                'name': name,
+                'rate': unit_price,
+                'quantity': qty
+            })
+
+        est_num = get_next_estimate_number(customer_name)
+        payload = {
+            'customer_id': customer_id,
+            'estimate_number': est_num,
+            'line_items': line_items,
+            'date': datetime.now().strftime('%Y-%m-%d')
+        }
+
+        url = f"{ZOHO_BASE_URL}/estimates"
+        r = requests.post(url, headers=zoho_headers(), json=payload, timeout=20)
+        res_data = r.json()
+
+        if res_data.get('code') == 0:
+            est = res_data.get('estimate', {})
+            est_id = est.get('estimate_id')
+            total = est.get('total', 0)
+
+            # Mark as sent & Send Email
+            requests.post(f"{ZOHO_BASE_URL}/estimates/{est_id}/status/sent", headers=zoho_headers(), timeout=10)
+            
+            send_telegram_notification(
+                f"<b>New Estimate Created via QuoteForm!</b>\n"
+                f"<b>Estimate #:</b> {est_num}\n"
+                f"<b>Customer:</b> {customer_name}\n"
+                f"<b>Total:</b> ₹{total}"
+            )
+
+            return jsonify({
+                'status': 'success',
+                'estimate_id': est_id,
+                'estimate_number': est_num,
+                'total': total
+            })
+        else:
+            return jsonify({'status': 'error', 'message': res_data.get('message', 'Failed to create estimate in Zoho.')})
+
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/quoteform/pdf/<estimate_id>')
 def quoteform_pdf(estimate_id):
     if not qf_logged_in():
-        from flask import redirect
-        return redirect('/quoteform')
+        return "Unauthorized", 401
     try:
-        pdf_bytes = get_estimate_pdf(estimate_id)
-        if not pdf_bytes:
-            return "<h3 style='font-family:sans-serif;padding:24px'>Could not fetch PDF from Zoho.</h3>", 404
-        view      = request.args.get('view') == '1'
-        raw_name  = request.args.get('name', 'quote').strip() or 'quote'
-        # Sanitize filename — keep alphanumeric, dash, underscore only
-        import re
-        safe_name = re.sub(r'[^A-Za-z0-9\-_]', '-', raw_name)
-        filename  = f"{safe_name}.pdf"
-        disp      = f'inline; filename="{filename}"' if view else f'attachment; filename="{filename}"'
-        from flask import Response
-        return Response(pdf_bytes, mimetype='application/pdf',
-                        headers={'Content-Disposition': disp})
+        url = f"{ZOHO_BASE_URL}/estimates/{estimate_id}"
+        headers = zoho_headers()
+        headers['Accept'] = 'application/pdf'
+        r = requests.get(url, headers=headers, params={'accept': 'pdf'}, timeout=20)
+        return Response(r.content, mimetype='application/pdf')
     except Exception as e:
-        return f"<h3 style='font-family:sans-serif;padding:24px'>Error: {e}</h3>", 500
+        return f"Error fetching PDF: {e}", 500
 
-# ── LAUNCH ────────────────────────────────────────────────────────────────────
-def open_browser():
-    webbrowser.open(f'http://localhost:{PORT}')
+# -----------------------------------------------------------------------------
+# HTML Templates
+# -----------------------------------------------------------------------------
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head><title>QuoteBot Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light p-4">
+<div class="container bg-white p-4 rounded shadow-sm">
+    <h2>QuoteBot & QuoteForm System</h2>
+    <p class="text-muted">Automated Quotation Generation & Zoho Invoice Bridge</p>
+    <a href="/quoteform" class="btn btn-primary">Go to QuoteForm Portal</a>
+</div>
+</body>
+</html>"""
+
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head><title>QuoteForm Login</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light d-flex align-items-center justify-content-center" style="height:100vh;">
+<div class="card p-4 shadow-sm" style="width:350px;">
+    <h4 class="card-title text-center mb-3">QuoteForm Access</h4>
+    {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
+    <form method="POST">
+        <div class="mb-3">
+            <label class="form-label">Enter PIN</label>
+            <input type="password" name="pin" class="form-control" required autofocus>
+        </div>
+        <button type="submit" class="btn btn-primary w-100">Unlock</button>
+    </form>
+</div>
+</body>
+</html>"""
+
+QUOTEFORM_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head><title>QuoteForm Portal</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+</head>
+<body class="bg-light p-4">
+<div class="container bg-white p-4 rounded shadow-sm">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>QuoteForm Portal</h2>
+        <a href="/quoteform/logout" class="btn btn-outline-danger btn-sm">Logout</a>
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label fw-bold">Select Customer/Store</label>
+        <select id="customerSelect" class="form-select"><option value="">Loading customers...</option></select>
+    </div>
+
+    <div class="mb-3">
+        <label class="form-label fw-bold">Bulk Paste Items</label>
+        <textarea id="bulkInput" class="form-control" rows="5" placeholder="Paste raw item list here (e.g., Ceara Long Pillar Cock – 2,400)"></textarea>
+        <button id="btnParse" class="btn btn-secondary mt-2">Parse List via AI</button>
+    </div>
+
+    <table class="table table-bordered mt-4" id="itemsTable">
+        <thead>
+            <tr><th>Item Description</th><th>Qty</th><th>Unit Price (₹)</th><th>Action</th></tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <div class="row align-items-center mt-3">
+        <div class="col-md-3">
+            <label class="form-label fw-bold">Markup Percentage (%)</label>
+            <input type="number" id="markupInput" class="form-control" value="0">
+        </div>
+        <div class="col-md-9 text-end">
+            <button id="btnSubmit" class="btn btn-success btn-lg">Generate Estimate in Zoho</button>
+        </div>
+    </div>
+</div>
+
+<script>
+$(document).ready(function() {
+    $.get('/api/customers', function(res) {
+        if(res.status === 'success') {
+            let html = '<option value="">Select a Customer...</option>';
+            res.customers.forEach(c => {
+                html += `<option value="${c.customer_id}">${c.contact_name}</option>`;
+            });
+            $('#customerSelect').html(html);
+        }
+    });
+
+    $('#btnParse').click(function() {
+        let txt = $('#bulkInput').val();
+        if(!txt) return alert('Please paste items first.');
+        $(this).prop('disabled', true).text('Parsing...');
+
+        $.ajax({
+            url: '/quoteform/parse-items',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ text: txt }),
+            success: function(res) {
+                $('#btnParse').prop('disabled', false).text('Parse List via AI');
+                if(res.status === 'success') {
+                    res.items.forEach(it => {
+                        appendRow(it.name, it.quantity, it.unit_price);
+                    });
+                    $('#bulkInput').val('');
+                } else {
+                    alert('Error: ' + res.message);
+                }
+            },
+            error: function() {
+                $('#btnParse').prop('disabled', false).text('Parse List via AI');
+                alert('Request failed');
+            }
+        });
+    });
+
+    function appendRow(name, qty, price) {
+        let row = `<tr>
+            <td><input type="text" class="form-control item-name" value="${name}"></td>
+            <td><input type="number" class="form-control item-qty" value="${qty}"></td>
+            <td><input type="number" class="form-control item-price" value="${price}"></td>
+            <td><button class="btn btn-danger btn-sm" onclick="$(this).closest('tr').remove()">Remove</button></td>
+        </tr>`;
+        $('#itemsTable tbody').append(row);
+    }
+
+    $('#btnSubmit').click(function() {
+        let cid = $('#customerSelect').val();
+        let cname = $('#customerSelect option:selected').text();
+        if(!cid) return alert('Please select a customer.');
+
+        let items = [];
+        $('#itemsTable tbody tr').each(function() {
+            items.push({
+                name: $(this).find('.item-name').val(),
+                quantity: $(this).find('.item-qty').val(),
+                unit_price: $(this).find('.item-price').val()
+            });
+        });
+
+        if(items.length === 0) return alert('No items added.');
+
+        $(this).prop('disabled', true).text('Creating Estimate...');
+
+        $.ajax({
+            url: '/quoteform/submit',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                customer_id: cid,
+                customer_name: cname,
+                items: items,
+                markup: $('#markupInput').val()
+            }),
+            success: function(res) {
+                $('#btnSubmit').prop('disabled', false).text('Generate Estimate in Zoho');
+                if(res.status === 'success') {
+                    alert('Estimate ' + res.estimate_number + ' created successfully!');
+                    window.open('/quoteform/pdf/' + res.estimate_id, '_blank');
+                } else {
+                    alert('Error: ' + res.message);
+                }
+            }
+        });
+    });
+});
+</script>
+</body>
+</html>"""
 
 if __name__ == '__main__':
-    print("\n" + "="*52)
-    print("  ⚡  QuoteBot — Zoho Invoice Automation")
-    print("="*52)
-    if IS_RAILWAY:
-        print(f"  Running on Railway · Port {PORT}")
-    else:
-        print(f"  Local: http://localhost:{PORT}")
-        Timer(1.5, open_browser).start()
-    print()
-    app.run(debug=False, host='0.0.0.0', port=PORT, use_reloader=False)
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
