@@ -285,17 +285,29 @@ ONLY return the JSON. Nothing else."""
             end = raw.rfind('}') + 1
             raw = raw[start:end]
 
-        # Try parsing directly; if single quotes were used, safely fix them
+        # Robust JSON parser with auto-repair for missing commas and quotes
         try:
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as jde:
             import re
-            # Replace single quotes around keys/values with double quotes
-            fixed = re.sub(r"'([^']*)'\s*:", r'"\1":', raw)
+            fixed = raw
+            # Fix single quotes
+            fixed = re.sub(r"'([^']*)'\s*:", r'"\1":', fixed)
             fixed = re.sub(r':\s*\'([^\']*)\'', r': "\1"', fixed)
-            # Remove trailing commas before closing braces/brackets
+            # Remove trailing commas
             fixed = re.sub(r',\s*([\]}])', r'\1', fixed)
-            return json.loads(fixed)
+            # Fix missing commas between lines/objects/arrays
+            fixed = re.sub(r'}\s*([{\"])', r'}, \1', fixed)
+            fixed = re.sub(r']\s*([{\"])', r'], \1', fixed)
+            fixed = re.sub(r'"\s*\n\s*"', '",\n"', fixed)
+            fixed = re.sub(r'}\s*\n\s*"', '},\n"', fixed)
+            fixed = re.sub(r']\s*\n\s*"', '],\n"', fixed)
+            fixed = re.sub(r'(\d+|\btrue\b|\bfalse\b|\bnull\b)\s*\n\s*"', r'\1,\n"', fixed)
+            
+            try:
+                return json.loads(fixed)
+            except Exception:
+                raise jde
 
     except Exception as e:
         raise Exception(f"AI service unavailable. Last error: {str(e)}. Please wait 30 seconds and try again.")
