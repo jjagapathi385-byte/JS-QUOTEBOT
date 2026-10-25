@@ -548,7 +548,7 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
 
 # ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
 HSN_KEYWORDS = [
-    # Plumbing & Hardware (Added for instant 0-token matching)
+    # Comprehensive Plumbing & Hardware mapping
     (['reducer', 'bush reducer'],                                                ('39174000', False)),
     (['brass threaded tee', 'tee'],                                              ('39174000', False)),
     (['shower arm', 'arm'],                                                      ('84819090', False)),
@@ -571,21 +571,6 @@ HSN_KEYWORDS = [
     (['screw set', 'screw', 'fastener', 'screws'],                               ('73181500', False)),
     (['wrench', 'spanner', 'tool'],                                              ('82041110', False)),
     (['nipple', 'extension nipple'],                                             ('73079990', False)),
-    (['hacksaw', 'blade'],                                                       ('82029110', False)),
-    (['wash basin'],
-    (['pillar cock', 'tap', 'cock'],                                             ('84818010', False)),
-    (['connection pipe', 'hose'],                                                ('84819090', False)),
-    (['ball valve', 'valve'],                                                    ('84818030', False)),
-    (['waste pipe', 'drain pipe'],                                               ('39172300', False)),
-    (['teflon tape', 'tape'],                                                    ('39199090', False)),
-    (['sink waste', 'coupling'],                                                 ('39269099', False)),
-    (['t bend', 'elbow', 'fitting', 'bends'],                                    ('39174000', False)),
-    (['bush', 'anchor bush'],                                                    ('39269099', False)),
-    (['screw set', 'screw', 'fastener', 'screws'],                               ('73181500', False)),
-    (['plug top', 'top'],                                                        ('85366990', False)),
-    (['wrench', 'spanner', 'tool', '24x27'],                                     ('82041110', False)),
-    (['nipple', 'extension nipple'],                                             ('73079990', False)),
-    (['mt bt'],                                                                  ('73079990', False)),
     (['hacksaw', 'blade'],                                                       ('82029110', False)),
     (['wash basin'],                                                             ('39221000', False)),
     # Services
@@ -676,10 +661,8 @@ Reply ONLY with a valid JSON array, one entry per item, in order:
 Nothing else."""
 
         try:
-            # Use your multi-provider fallback (Groq -> Gemini) so it never fails
             raw = call_ai_with_fallback(prompt, max_tokens=1000)
             
-            # Clean markdown fences
             if '```' in raw:
                 parts = raw.split('```')
                 raw = parts[1] if len(parts) > 1 else parts[0]
@@ -709,7 +692,7 @@ Nothing else."""
         if i not in result:
             result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
 
-        return result
+    return result  # <--- Properly un-indented outside the loop!
 
 def get_default_notes():
     """Fetch default customer notes from Zoho estimate settings."""
