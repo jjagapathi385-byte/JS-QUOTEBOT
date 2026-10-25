@@ -55,6 +55,57 @@ def save_tokens(updates):
 # In-memory token cache to avoid refreshing on every call
 _token_cache = {'access_token': None, 'expires_at': 0}
 
+# ── ZOHO LIST CACHE (10 minutes) ──────────────────────────────────────────────
+# Prevents fetching 400+ customers and 500+ items on every quote creation
+_LIST_CACHE_TTL = 600  # 10 minutes
+_list_cache = {
+    'customers': {'data': None, 'ts': 0},
+    'items':     {'data': None, 'ts': 0},
+}
+
+def _lc_get(key):
+    entry = _list_cache.get(key, {})
+    if entry.get('data') is not None and (_time.time() - entry['ts']) < _LIST_CACHE_TTL:
+        return entry['data']
+    return None
+
+def _lc_set(key, data):
+    _list_cache[key] = {'data': data, 'ts': _time.time()}
+
+def fetch_all_customers():
+    """Fetch all customers from Zoho — cached for 10 minutes."""
+    cached = _lc_get('customers')
+    if cached is not None:
+        return cached
+    contacts = []
+    page = 1
+    while True:
+        r    = zh_get('/contacts', {'contact_type': 'customer', 'page': page, 'per_page': 200})
+        data = r.json()
+        contacts.extend(data.get('contacts', []))
+        if not data.get('page_context', {}).get('has_more_page', False):
+            break
+        page += 1
+    _lc_set('customers', contacts)
+    return contacts
+
+def fetch_all_items():
+    """Fetch all items from Zoho — cached for 10 minutes."""
+    cached = _lc_get('items')
+    if cached is not None:
+        return cached
+    items = []
+    page  = 1
+    while True:
+        r    = zh_get('/items', {'page': page, 'per_page': 200})
+        data = r.json()
+        items.extend(data.get('items', []))
+        if not data.get('page_context', {}).get('has_more_page', False):
+            break
+        page += 1
+    _lc_set('items', items)
+    return items
+
 def get_fresh_token():
     import time
     t = load_tokens()
@@ -196,7 +247,7 @@ If nothing valid for notes → return empty string "".
 ONLY return the JSON. Nothing else."""
 
     import time
-    models = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant'] 
+    models = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'] 
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -218,32 +269,35 @@ ONLY return the JSON. Nothing else."""
             )
             d = r.json()
 
-            # Rate limit — wait and retry with next model
+            # Rate limit — wait longer and try next model
             if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                wait = 5 * (attempt + 1)
+                wait = 10 * (attempt + 1)
+                last_error = f"Rate limited on {model}"
                 time.sleep(wait)
                 continue
 
-            # Other API error
+            # Model unavailable or any API error — try next model, don't raise
             if 'error' in d:
                 err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                raise Exception(f"Groq error: {err_msg}")
+                last_error = f"Model {model} error: {err_msg}"
+                time.sleep(3)
+                continue
 
             if 'choices' not in d or not d['choices']:
-                last_error = str(d)[:300]
+                last_error = f"No choices from {model}: {str(d)[:200]}"
                 time.sleep(3)
                 continue
 
             try:
                 raw = d['choices'][0]['message']['content'].strip()
             except (KeyError, IndexError) as ke:
-                last_error = f"Parse error: {ke} in {str(d)[:200]}"
+                last_error = f"Parse error on {model}: {ke}"
                 time.sleep(3)
                 continue
 
             if not raw:
-                last_error = "Empty AI response"
-                time.sleep(3)
+                last_error = f"Empty response from {model}"
+                time.sleep(5)
                 continue
 
             # Strip markdown fences
@@ -263,8 +317,7 @@ ONLY return the JSON. Nothing else."""
             time.sleep(3)
             continue
         except Exception as e:
-            if 'Groq error' in str(e):
-                raise
+            last_error = str(e)
             time.sleep(2)
             continue
 
@@ -301,9 +354,16 @@ BRAND_PREFIXES = {
 }
 
 def extract_store_code(text):
-    """Extract store code like K589, Y044, Z091, P287, C499 from text."""
+    """Extract store code from text. Handles:
+    - Standard codes: K589, Y044, Z091, P287, C499
+    - Paradise codes: S11R29, S11R06, S34R01 etc.
+    """
     import re
-    # Match a letter prefix followed by 3+ digits (case-insensitive)
+    # Paradise style: S + digits + R + digits (e.g. S11R29, S34R01)
+    match = re.search(r'\b(S\d{1,2}R\d{2,3})\b', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    # Standard style: single letter prefix + 3-4 digits
     match = re.search(r'\b([KYPZCVkypcvz])(\d{3,4})\b', text)
     if match:
         return (match.group(1).upper() + match.group(2)).upper()
@@ -314,18 +374,7 @@ def find_customer(name, raw_message=None):
     raw_message: original unparsed message — used to extract store code
     directly in case AI missed it in the customer name.
     """
-    # Fetch all customers
-    all_contacts = []
-    page = 1
-    while True:
-        r = zh_get('/contacts', {'contact_type': 'customer', 'page': page, 'per_page': 200})
-        data = r.json()
-        batch = data.get('contacts', [])
-        all_contacts.extend(batch)
-        if not data.get('page_context', {}).get('has_more_page', False):
-            break
-        page += 1
-
+    all_contacts = fetch_all_customers()
     if not all_contacts:
         return None
 
@@ -337,11 +386,13 @@ def find_customer(name, raw_message=None):
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
-            # Store code is always the last segment after final dash e.g. KFC-GUDIMALKAPUR-HYD-K589
-            if cname.endswith(f'-{store_code}') or f'-{store_code}-' in cname or cname == store_code:
+            # Match store code anywhere in name — end, middle, or exact
+            if (cname.endswith(f'-{store_code}') or
+                f'-{store_code}-' in cname or
+                f'-{store_code}' in cname or
+                cname == store_code):
                 return c
-        # If code found in input but no exact match, warn but continue to AI
-        # (handles typos in code)
+        # Code found in input but no exact match — continue to AI (handles typos)
 
     # ── Step 2: Brand filter + AI location match ──────────────────────────────
     name_upper = name.upper()
@@ -356,6 +407,8 @@ def find_customer(name, raw_message=None):
         brand = 'COSTA'
     elif 'VAANGO' in name_upper:
         brand = 'VAANGO'
+    elif 'PARADISE' in name_upper:
+        brand = 'PARADISE'
 
     # Also detect brand from store code prefix if present
     if not brand and store_code:
@@ -378,6 +431,8 @@ def find_customer(name, raw_message=None):
             filtered = [c for c in all_contacts if 'COSTA' in c.get('contact_name', '').upper()]
         elif brand == 'VAANGO':
             filtered = [c for c in all_contacts if 'VAANGO' in c.get('contact_name', '').upper()]
+        elif brand == 'PARADISE':
+            filtered = [c for c in all_contacts if 'PARADISE' in c.get('contact_name', '').upper()]
         else:
             filtered = all_contacts
     else:
@@ -400,8 +455,12 @@ Customers:
 Rules:
 1. Match by LOCATION — find the customer whose location words best match the input.
 2. All customers in this list are already the correct brand — just find the right location.
-3. Store codes like K589, Y044 are at the end of the customer name — if the input has a code, match it exactly.
-4. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
+3. Store codes like K589, Y044, S11R29 are in the customer name — if the input has a code, match it exactly.
+4. For location matching — ignore hyphens and abbreviations:
+   "moosapet" matches "MOOSAPET", "balanagar" matches "BALANAGAR",
+   "malkajgiri" matches "MALKAJGIRI", "asraonagar" matches "ASRAO-NAGAR" or "ASRAONAGAR"
+5. Partial location match is acceptable if it's clearly the same place.
+6. Reply with ONLY the number (e.g. "5") or "0" if no good match. Nothing else."""
 
     r2 = requests.post(
         'https://api.groq.com/openai/v1/chat/completions',
@@ -439,18 +498,7 @@ def match_all_items(item_names):
     if not item_names:
         return {}
 
-    # Fetch full Zoho item list once
-    all_items = []
-    page = 1
-    while True:
-        r    = zh_get('/items', {'page': page, 'per_page': 200})
-        data = r.json()
-        batch = data.get('items', [])
-        all_items.extend(batch)
-        if not data.get('page_context', {}).get('has_more_page', False):
-            break
-        page += 1
-
+    all_items = fetch_all_items()
     if not all_items:
         return {i: None for i in range(len(item_names))}
 
@@ -481,7 +529,7 @@ Reply ONLY with a valid JSON array, one entry per input item, in order:
 
     import time
     import logging
-    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -602,16 +650,90 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
         raise Exception(f"Item creation failed: {resp}")
     return item
 
+# ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
+HSN_KEYWORDS = [
+    # Services
+    (['ac ', 'hvac', 'air condition', 'air-condition'],                         ('995463', True)),
+    (['repair', 'maintenance', 'servic'],                                        ('995469', True)),
+    (['concrete', 'rcc'],                                                        ('995454', True)),
+    (['structural steel', 'steel erect'],                                        ('995455', True)),
+    (['masonry', 'brickwork', 'brick work'],                                     ('995456', True)),
+    (['scaffold'],                                                               ('995457', True)),
+    (['special trade', 'construction'],                                          ('995458', True)),
+    (['floor', 'tiling', 'tile'],                                               ('995474', True)),
+    (['building completion', 'finishing'],                                       ('995478', True)),
+    (['machinery repair', 'machine repair'],                                     ('998717', True)),
+    (['equipment repair'],                                                       ('998719', True)),
+    (['labour', 'labor', 'manpower', 'workforce'],                              ('995511', True)),
+    (['cleaning', 'housekeeping'],                                               ('998531', True)),
+    # Refrigeration / HVAC goods
+    (['compressor', 'refriger'],                                                ('84143090', False)),
+    (['compressor part', 'fan part'],                                            ('84149090', False)),
+    (['refrigeration equip'],                                                    ('84189900', False)),
+    (['centrifugal pump', 'pump'],                                               ('84137090', False)),
+    # Electrical goods
+    (['tempe box', 'distribution board', 'db box', 'panel board', 'mcb box'],   ('85371000', False)),
+    (['armoured cable', 'armored cable', 'copper armoured', 'cable'],           ('85444290', False)),
+    (['mcb', 'circuit breaker', 'breaker'],                                     ('85362000', False)),
+    (['wire', 'sq mm'],                                                          ('85444290', False)),
+    (['copper ring lug', 'copper pin', 'lug'],                                  ('85369090', False)),
+    (['switch', 'socket', 'plug'],                                               ('85363010', False)),
+    (['led', 'light', 'lamp', 'bulb', 'fitting'],                               ('94054090', False)),
+    (['fan'],                                                                    ('84145100', False)),
+    # Pipes / fittings
+    (['pvc casing', 'casing box', 'pvc box'],                                   ('39172300', False)),
+    (['pvc pipe', 'conduit'],                                                    ('39172300', False)),
+    (['patti', 'gi strip', 'earth strip'],                                       ('72142000', False)),
+    # Hardware
+    (['screw', 'bolt', 'nut', 'fastener'],                                       ('73181500', False)),
+    # Paint / adhesive
+    (['paint', 'primer', 'putty', 'varnish'],                                   ('32089090', False)),
+    (['tape', 'adhesive', 'fevicol', 'fevibond', 'sealant', 'silicone'],        ('35069900', False)),
+    # Other
+    (['accessory', 'accessories', 'misc', 'sundry', 'consumable'],              ('85389000', False)),
+]
+
+def local_hsn_lookup(item_name):
+    """Keyword-based HSN lookup — instant, no tokens.
+    Returns (hsn_code, is_service) or None if no match.
+    """
+    name_lower = item_name.lower()
+    for keywords, result in HSN_KEYWORDS:
+        if any(kw in name_lower for kw in keywords):
+            return result
+    return None
+
 def detect_hsn_for_items(items):
     """
-    Single Groq call to detect HSN/SAC code and goods/service flag for all items.
-    items: list of name strings
+    Detect HSN/SAC codes for all items.
+    Step 1: Local keyword lookup (instant, no tokens)
+    Step 2: Groq AI call only for items not matched locally
     Returns: dict keyed by index {0: {hsn_or_sac, is_service}, ...}
     """
     if not items:
         return {}
 
-    items_numbered = "\n".join([f"{i+1}. {name}" for i, name in enumerate(items)])
+    import time
+    import logging
+    import re as _re
+
+    # ── Step 1: Local keyword lookup for all items ────────────────────────────
+    result       = {}
+    needs_ai     = []   # (original_idx, name) for items not matched locally
+
+    for i, name in enumerate(items):
+        local = local_hsn_lookup(name)
+        if local:
+            result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
+        else:
+            needs_ai.append((i, name))
+
+    # If all items matched locally — return immediately, no Groq needed
+    if not needs_ai:
+        return result
+
+    # ── Step 2: Groq call only for unmatched items ────────────────────────────
+    items_numbered = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
 
     prompt = f"""You are an Indian GST expert. For each item below, provide the correct HSN code (for goods) or SAC code (for services).
 
@@ -620,39 +742,21 @@ Items:
 
 Rules:
 1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
-2. Use these exact codes where applicable:
-   LED lights/lamps → 94054090, goods
-   Tape/adhesive/Fevicol/Fevibond → 35069900, goods
-   PVC pipe/fittings → 39172300, goods
-   Wire/cable → 85444290, goods
-   Switch/socket → 85363010, goods
-   MCB/breaker → 85362000, goods
-   Paint/primer/putty → 32089090, goods
-   Cement → 25232900, goods
-   Steel/iron → 72142000, goods
-   Screws/bolts/nuts → 73181500, goods
-   Plywood/wood → 44121000, goods
-   Fan → 84145100, goods
-   Pump → 84137090, goods
-   Tools (hammers, drills) → 82051000, goods
-   Safety equipment (gloves, helmets) → 39262090, goods
-   Cleaning materials/chemicals → 34029090, goods
-   Cleaning/housekeeping service → 998531, service
-   Maintenance/repair service → 995469, service
-   Labour charges → 995511, service
-   Security service → 998523, service
+2. Common codes:
+   Magnetar/magnet=85051100, Air sensor/counter sensor=85269090,
+   Capacitor=85321000, Diode=85411000, Resistor=85334000,
+   Transformer=85043300, Relay=85364900, Thermostat=90325000,
+   Refrigerant gas=38249099, Brazing rod=83112000, Gas torch=84689900,
+   Plywood/wood=44121000, Tools/drill=82051000, Safety equip=39262090,
+   Cement=25232900, Cleaning chemical=34029090
 3. If genuinely unsure → HSN 99999999 for goods, SAC 999999 for services.
 
-Reply ONLY with a valid JSON array. No markdown, no explanation, nothing else:
+Reply ONLY with a valid JSON array:
 [
-  {{"item": 1, "hsn_or_sac": "94054090", "is_service": false}},
-  {{"item": 2, "hsn_or_sac": "998531", "is_service": true}}
+  {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
 ]"""
 
-    import time
-    import logging
-    import re as _re
-    models     = ['openai/gpt-oss-120b', 'qwen/qwen3-32b', 'llama-3.1-8b-instant']
+    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant']
     last_error = 'No response received'
 
     for attempt in range(4):
@@ -718,12 +822,12 @@ Reply ONLY with a valid JSON array. No markdown, no explanation, nothing else:
                 time.sleep(2)
                 continue
 
-            # Build result dict keyed by 0-based item index
-            result = {}
+            # Map Groq results back to original item indices
             for entry in parsed:
-                idx = int(entry.get('item', 0)) - 1
-                if idx >= 0:
-                    result[idx] = {
+                ai_idx = int(entry.get('item', 0)) - 1
+                if 0 <= ai_idx < len(needs_ai):
+                    orig_idx = needs_ai[ai_idx][0]
+                    result[orig_idx] = {
                         'hsn_or_sac': str(entry.get('hsn_or_sac', '99999999')),
                         'is_service':  bool(entry.get('is_service', False))
                     }
@@ -742,8 +846,9 @@ Reply ONLY with a valid JSON array. No markdown, no explanation, nothing else:
             time.sleep(2)
             continue
 
-    logging.warning(f'detect_hsn_for_items failed after all attempts: {last_error}')
-    return {}
+    # Groq failed — return what local lookup found, rest get 99999999
+    logging.warning(f'detect_hsn_for_items Groq failed: {last_error}')
+    return result
 
 
 _last_seq = {'value': 0}
@@ -778,11 +883,16 @@ def get_next_seq():
 
 def create_estimate(customer_id, customer_name, line_items, notes=''):
     """Create estimate with correct number directly — works in both auto and manual Zoho mode."""
-    clean_name = customer_name.strip().upper().replace(' ', '_')
+    # Extract last segment of customer name as store code
+    # e.g. "PHD-OGL-GUNT-RD-HYDR-P380" → "P380"
+    # e.g. "KFC-ATTAPUR-HYD-K318" → "K318"
+    parts      = customer_name.strip().upper().split('-')
+    last_seg   = parts[-1].strip().replace(' ', '_') if parts else customer_name.strip().upper()
+    prefix     = f"JSINT-{last_seg}"
 
     for attempt in range(5):  # Retry up to 5 times on conflict
         seq           = get_next_seq() + attempt
-        custom_number = f"{clean_name}-QT-{str(seq).zfill(6)}"
+        custom_number = f"{prefix}-QT-{str(seq).zfill(6)}"
 
         payload = {
             "customer_id":     customer_id,
@@ -905,7 +1015,7 @@ def next_number():
         <h2>📋 Next Quote Number</h2>
         <p>Use this sequence number when creating a quote manually in Zoho.</p>
         <div class="num">{{ next_no }}</div>
-        <div class="format">Format: <strong>STORENAME-QT-{{ next_no }}</strong><br>e.g. KFC-SURYAPET-QT-{{ next_no }}</div>
+        <div class="format">Format: <strong>JSINT-{STORECODE}-QT-{{ next_no }}</strong><br>e.g. JSINT-K318-QT-{{ next_no }}</div>
         <button onclick="navigator.clipboard.writeText('{{ next_no }}').then(()=>alert('Copied!'))">Copy Number</button>
         </body></html>""", next_no=next_no)
     except Exception as e:
@@ -1394,16 +1504,7 @@ def qf_logged_in():
 
 def get_all_customers():
     """Fetch all customers from Zoho, return list of {id, name, state}."""
-    all_contacts = []
-    page = 1
-    while True:
-        r = zh_get('/contacts', {'contact_type': 'customer', 'page': page, 'per_page': 200})
-        data = r.json()
-        batch = data.get('contacts', [])
-        all_contacts.extend(batch)
-        if not data.get('page_context', {}).get('has_more_page', False):
-            break
-        page += 1
+    all_contacts = fetch_all_customers()
     result = []
     for c in all_contacts:
         # Use Place of Supply for state — more reliable than billing address
