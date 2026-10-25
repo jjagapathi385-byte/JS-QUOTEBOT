@@ -693,6 +693,8 @@ Nothing else."""
             result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
 
     return result  # <--- Properly un-indented outside the loop!
+    
+_last_seq = {'value': 0}
 
 def get_default_notes():
     """Fetch default customer notes from Zoho estimate settings."""
