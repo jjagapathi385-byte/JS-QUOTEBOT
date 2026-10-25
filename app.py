@@ -549,12 +549,6 @@ Rules:
     return None
 
 def match_all_items(item_names):
-    """
-    Fetch Zoho item list ONCE, then match all item names in a single Groq call.
-    Returns dict keyed by 0-based index:
-      {0: zoho_item_dict or None, 1: zoho_item_dict or None, ...}
-    None means no match found — caller should create the item.
-    """
     if not item_names:
         return {}
 
@@ -587,91 +581,29 @@ Reply ONLY with a valid JSON array, one entry per input item, in order:
 ]
 0 means no match found. Nothing else in your response."""
 
-    import time
-    import logging
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
-    last_error = 'No response received'
+    try:
+        raw = call_ai_with_fallback(prompt, max_tokens=500)
+        
+        # Strip markdown fences
+        if '```' in raw:
+            parts = raw.split('```')
+            raw   = parts[1] if len(parts) > 1 else parts[0]
+            if raw.startswith('json'): raw = raw[4:]
+            raw = raw.strip()
 
-    for attempt in range(4):
-        model = models[min(attempt, len(models) - 1)]
-        try:
-            r2 = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-                json={
-                    'model':       model,
-                    'messages':    [{'role': 'user', 'content': prompt}],
-                    'temperature': 0,
-                    'max_tokens':  500
-                },
-                timeout=60
-            )
-            d2 = r2.json()
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return {i: None for i in range(len(item_names))}
 
-            if r2.status_code == 429 or (isinstance(d2.get('error'), dict) and 'rate' in str(d2['error']).lower()):
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            if 'error' in d2:
-                last_error = str(d2['error'])
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d2 or not d2['choices']:
-                last_error = str(d2)[:200]
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d2['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = str(ke)
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = 'Empty response'
-                time.sleep(3)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw   = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'): raw = raw[4:]
-                raw = raw.strip()
-
-            parsed = json.loads(raw)
-            if not isinstance(parsed, list):
-                last_error = 'Not a list'
-                time.sleep(2)
-                continue
-
-            # Build result dict
-            result = {i: None for i in range(len(item_names))}
-            for entry in parsed:
-                input_idx = int(entry.get('input', 0)) - 1
-                zoho_idx  = int(entry.get('zoho', 0)) - 1
-                if 0 <= input_idx < len(item_names) and 0 <= zoho_idx < len(all_items):
-                    result[input_idx] = all_items[zoho_idx]
-            return result
-
-        except json.JSONDecodeError:
-            last_error = 'JSON decode error'
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            last_error = 'Timeout'
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    logging.warning(f'match_all_items failed after all attempts: {last_error}')
-    # On total failure return None for all — caller will attempt to create
-    return {i: None for i in range(len(item_names))}
+        result = {i: None for i in range(len(item_names))}
+        for entry in parsed:
+            input_idx = int(entry.get('input', 0)) - 1
+            zoho_idx  = int(entry.get('zoho', 0)) - 1
+            if 0 <= input_idx < len(item_names) and 0 <= zoho_idx < len(all_items):
+                result[input_idx] = all_items[zoho_idx]
+        return result
+    except Exception:
+        return {i: None for i in range(len(item_names))}
 
 
 
@@ -720,6 +652,22 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
 
 # ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
 HSN_KEYWORDS = [
+    # Plumbing & Hardware (Added for instant 0-token matching)
+    (['pillar cock', 'tap', 'cock'],                                             ('84818010', False)),
+    (['connection pipe', 'hose'],                                                ('84819090', False)),
+    (['ball valve', 'valve'],                                                    ('84818030', False)),
+    (['waste pipe', 'drain pipe'],                                               ('39172300', False)),
+    (['teflon tape', 'tape'],                                                    ('39199090', False)),
+    (['sink waste', 'coupling'],                                                 ('39269099', False)),
+    (['t bend', 'elbow', 'fitting', 'bends'],                                    ('39174000', False)),
+    (['bush', 'anchor bush'],                                                    ('39269099', False)),
+    (['screw set', 'screw', 'fastener', 'screws'],                               ('73181500', False)),
+    (['plug top', 'top'],                                                        ('85366990', False)),
+    (['wrench', 'spanner', 'tool', '24x27'],                                     ('82041110', False)),
+    (['nipple', 'extension nipple'],                                             ('73079990', False)),
+    (['mt bt'],                                                                  ('73079990', False)),
+    (['hacksaw', 'blade'],                                                       ('82029110', False)),
+    (['wash basin'],                                                             ('39221000', False)),
     # Services
     (['ac ', 'hvac', 'air condition', 'air-condition'],                         ('995463', True)),
     (['repair', 'maintenance', 'servic'],                                        ('995469', True)),
@@ -752,11 +700,9 @@ HSN_KEYWORDS = [
     (['pvc casing', 'casing box', 'pvc box'],                                   ('39172300', False)),
     (['pvc pipe', 'conduit'],                                                    ('39172300', False)),
     (['patti', 'gi strip', 'earth strip'],                                       ('72142000', False)),
-    # Hardware
-    (['screw', 'bolt', 'nut', 'fastener'],                                       ('73181500', False)),
     # Paint / adhesive
     (['paint', 'primer', 'putty', 'varnish'],                                   ('32089090', False)),
-    (['tape', 'adhesive', 'fevicol', 'fevibond', 'sealant', 'silicone'],        ('35069900', False)),
+    (['adhesive', 'fevicol', 'fevibond', 'sealant', 'silicone'],                ('35069900', False)),
     # Other
     (['accessory', 'accessories', 'misc', 'sundry', 'consumable'],              ('85389000', False)),
 ]
@@ -774,7 +720,7 @@ def local_hsn_lookup(item_name):
 def detect_hsn_for_items(items):
     """
     Detect HSN/SAC codes for all items using local keyword lookup first.
-    Completely bypasses Groq if local rules match, saving tokens.
+    Completely 0-tokens for all standard plumbing/electrical items.
     """
     if not items:
         return {}
@@ -785,131 +731,9 @@ def detect_hsn_for_items(items):
         if local:
             result[i] = {'hsn_or_sac': local[0], 'is_service': local[1]}
         else:
-            # Fallback default HSN if local lookup misses (using your preferred code)
-            result[i] = {'hsn_or_sac': '99549000', 'is_service': False}
+            # Clean generic fallback if local keyword misses
+            result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
             
-    return result
-
-    # ── Step 2: Groq call only for unmatched items ────────────────────────────
-    items_numbered = "\n".join([f"{i+1}. {name}" for i, (_, name) in enumerate(needs_ai)])
-
-    prompt = f"""You are an Indian GST expert. For each item below, provide the correct HSN code (for goods) or SAC code (for services).
-
-Items:
-{items_numbered}
-
-Rules:
-1. Goods → 8-digit HSN code. Services → 6-digit SAC code.
-2. Common codes:
-   Magnetar/magnet=85051100, Air sensor/counter sensor=85269090,
-   Capacitor=85321000, Diode=85411000, Resistor=85334000,
-   Transformer=85043300, Relay=85364900, Thermostat=90325000,
-   Refrigerant gas=38249099, Brazing rod=83112000, Gas torch=84689900,
-   Plywood/wood=44121000, Tools/drill=82051000, Safety equip=39262090,
-   Cement=25232900, Cleaning chemical=34029090, Refrigerator/compressor=841430, 
-   Water pump=841370, Refrigeration parts=841899, PVC pipes=391723, Paints=320890, 
-   Iron/steel bolts=731815, Nuts=731816, Steel bars/rods=721420, Electrical wires/cables=854449,
-   Circuit breakers=853620, Plugs/sockets=853669, Cement=252329, Air conditioner=841510,
-   Rigid plastic pipes=391723, Centrifugal pump parts=841391, freezer=841810
-3. If genuinely unsure → HSN 854800 for goods, SAC 995459 for services.
-
-Reply ONLY with a valid JSON array:
-[
-  {{"item": 1, "hsn_or_sac": "85051100", "is_service": false}}
-]"""
-
-    models     = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']
-    last_error = 'No response received'
-
-    for attempt in range(4):
-        model = models[min(attempt, len(models) - 1)]
-        try:
-            r = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-                json={
-                    'model':       model,
-                    'messages':    [{'role': 'user', 'content': prompt}],
-                    'temperature': 0,
-                    'max_tokens':  1000
-                },
-                timeout=60
-            )
-            d = r.json()
-
-            # Rate limit — wait and retry with next model
-            if r.status_code == 429 or (isinstance(d.get('error'), dict) and 'rate' in str(d['error']).lower()):
-                time.sleep(5 * (attempt + 1))
-                continue
-
-            if 'error' in d:
-                err_msg = d['error'].get('message', str(d['error'])) if isinstance(d['error'], dict) else str(d['error'])
-                last_error = err_msg
-                time.sleep(3)
-                continue
-
-            if 'choices' not in d or not d['choices']:
-                last_error = str(d)[:200]
-                time.sleep(3)
-                continue
-
-            try:
-                raw = d['choices'][0]['message']['content'].strip()
-            except (KeyError, IndexError) as ke:
-                last_error = f"Parse error: {ke}"
-                time.sleep(3)
-                continue
-
-            if not raw:
-                last_error = 'Empty response'
-                time.sleep(3)
-                continue
-
-            # Strip markdown fences
-            if '```' in raw:
-                parts = raw.split('```')
-                raw   = parts[1] if len(parts) > 1 else parts[0]
-                if raw.startswith('json'): raw = raw[4:]
-                raw = raw.strip()
-
-            # If model wrapped array in object — extract it
-            if raw.startswith('{'):
-                arr_match = _re.search(r'\[.*\]', raw, _re.DOTALL)
-                if arr_match:
-                    raw = arr_match.group(0)
-
-            parsed = json.loads(raw)
-            if not isinstance(parsed, list):
-                last_error = 'Response was not a list'
-                time.sleep(2)
-                continue
-
-            # Map Groq results back to original item indices
-            for entry in parsed:
-                ai_idx = int(entry.get('item', 0)) - 1
-                if 0 <= ai_idx < len(needs_ai):
-                    orig_idx = needs_ai[ai_idx][0]
-                    result[orig_idx] = {
-                        'hsn_or_sac': str(entry.get('hsn_or_sac', '99545900')),
-                        'is_service':  bool(entry.get('is_service', False))
-                    }
-            return result
-
-        except json.JSONDecodeError:
-            last_error = 'JSON decode error'
-            time.sleep(2)
-            continue
-        except requests.exceptions.Timeout:
-            last_error = 'Timeout'
-            time.sleep(3)
-            continue
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2)
-            continue
-
-    # Groq failed — return what local lookup found, rest get 854800
-    logging.warning(f'detect_hsn_for_items Groq failed: {last_error}')
     return result
 
 
@@ -2276,25 +2100,10 @@ Return ONLY this exact JSON array format:
 
 ONLY return the JSON array. Nothing else."""
 
-        r = requests.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            headers={'Authorization': f'Bearer {GROQ_KEY}', 'Content-Type': 'application/json'},
-            json={
-                'model': 'openai/gpt-oss-120b',
-                'messages': [{'role': 'user', 'content': prompt}],
-                'temperature': 0.1,
-                'max_tokens': 2000  # <--- Increased token limit so long item lists don't cut off
-            },
-            timeout=30
-        )
-        d = r.json()
-        
-        if 'choices' not in d or not d['choices']:
-            return jsonify({'status': 'error', 'message': f'AI service error: {d}'})
+        # Call AI with automatic Groq -> Gemini fallback
+        raw = call_ai_with_fallback(prompt, max_tokens=2000)
 
-        raw = d['choices'][0]['message']['content'].strip()
-
-        # <--- Robust markdown fence cleaning & JSON boundary isolation
+        # Robust markdown fence cleaning & JSON boundary isolation
         if '```' in raw:
             parts = raw.split('```')
             for p in parts:
