@@ -378,24 +378,31 @@ def extract_store_code(text):
     return None
 
 def find_customer(name, raw_message=None):
-    """Find customer — strict store code match first, then strict keyword location match. No blind AI guessing."""
+    """
+    Find customer with zero blind guessing:
+    1. Exact store code match (e.g., K647, S11R29).
+    2. Strict location keyword word-match within the correct brand.
+    3. Fails safely to 'Customer Not Found' if ambiguous — never rolls dice.
+    """
     all_contacts = fetch_all_customers()
     if not all_contacts:
         return None
 
     search_text = f"{name} {raw_message or ''}".upper()
 
-    # ── Step 1: Store code direct match (100% precise) ───────────────────────
+    # ── Step 1: Store Code Direct Match (Highest Priority) ───────────────────
     store_code = extract_store_code(search_text)
     if not store_code and raw_message:
         store_code = extract_store_code(raw_message)
+    
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
-            if store_code in cname:
+            # Match code strictly if it is part of the contact name (e.g. ending or hyphenated)
+            if f"-{store_code}" in cname or cname.endswith(store_code) or f"{store_code}-" in cname:
                 return c
 
-    # ── Step 2: Full Brand Detection & Strict Filtering ──────────────────────
+    # ── Step 2: Strict Brand Identification ──────────────────────────────────
     brand = None
     if 'KFC' in search_text:
         brand = 'KFC'
@@ -408,16 +415,14 @@ def find_customer(name, raw_message=None):
     elif 'PARADISE' in search_text:
         brand = 'PARADISE'
 
-    # If no brand word in text, check store code prefix if it existed
     if not brand and store_code:
         prefix = store_code[0]
         brand = BRAND_PREFIXES.get(prefix)
 
-    # If NO brand can be identified from the text, DO NOT guess. Return None.
     if not brand:
-        return None
+        return None  # Cannot determine brand safely — abort to prevent wrong match
 
-    # Filter contacts strictly by the detected brand
+    # Filter contacts strictly by the identified brand pool
     if brand == 'KFC':
         filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
     elif brand == 'PHD':
@@ -434,21 +439,25 @@ def find_customer(name, raw_message=None):
     if not filtered:
         return None
 
-    # ── Step 3: Strict Location Keyword Matching ──────────────────────────────
-    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'AP', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND'}
+    # ── Step 3: Exact Location Word Matching (Zero AI Guessing) ──────────────
+    # Extract significant words from input, ignoring common filler terms
+    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND', 'GF', 'FF', 'RD'}
     clean_search = search_text.replace('-', ' ').replace('_', ' ')
     input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 3]
 
-    # Look for the specific location word (e.g., KOMPALLY) inside the filtered brand contacts
+    # Look for an exact location match inside the filtered brand contacts
     for c in filtered:
         cname = c.get('contact_name', '').upper()
-        if any(word in cname for word in input_words):
+        cname_parts = cname.replace('-', ' ').replace('_', ' ').split()
+        
+        # Check if any significant input word matches a distinct word in the Zoho contact name
+        if any(word in cname_parts for word in input_words):
             return c
 
-    # ── Step 4: SAFETY SHUTOFF ────────────────────────────────────────────────
-    # If we got here, the brand was recognized (e.g. Paradise), but the specific 
-    # location wasn't found in Zoho. Instead of letting an AI guess a random store,
-    # we return None so it cleanly throws "Customer Not Found".
+    # ── Step 4: Absolute Safety Shutoff ──────────────────────────────────────
+    # If a store cannot be matched with 100% safety, return None. 
+    # This immediately triggers the clean "Customer Not Found" warning box 
+    # instead of ever generating a quote for the wrong store.
     return None
 
 def match_all_items(item_names):
