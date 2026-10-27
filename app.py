@@ -216,47 +216,51 @@ def parse_with_gemini(message):
     if len(message) > 3000:
         message = message[:3000]
 
-    prompt = f"""You are a quotation parser for an Indian hardware/electrical supplies business.
-
-Parse this WhatsApp quotation message and return ONLY a valid JSON object. No markdown, no explanation.
+    prompt = f"""You are a precise quotation parser for an Indian hardware and maintenance business. Parse this incoming message into strict JSON.
 
 Message:
 ---
 {message}
 ---
 
-Rules:
-1. Extract customer/store name from the first line or header (e.g. "store- kfc moosapet" -> customer_name: "KFC Moosapet").
-2. For each item: extract name, quantity (default 1), and unit_price. 
-   - Separators can be dash (-), comma (,), or spaces (e.g. "PVC Elbow 1 inch-150" -> name="PVC Elbow 1 inch", unit_price=150, quantity=1).
-3. Extract email if present at the bottom.
-4. Extract work context/notes if present.
+CRITICAL PARSING & GROUPING RULES:
+1. **Header Identification:** Any lines referencing store names, brand codes, or locations (e.g., "Kfc k871", "Beach road KFC") belong ONLY in `customer_name`. NEVER add store/location lines as items!
+2. **Lumped Price / Multi-Item Handling:**
+   - If multiple unpriced items are listed followed by a single lumped amount (e.g.:
+       Rope light drive
+       Aircutton
+       Frezzer buzzarrr : 4500
+     ), DO NOT create ₹0.00 line items! 
+   - Instead, combine them into ONE single line item:
+     - `name`: "Electrical & Maintenance Materials" (or the main item name)
+     - `description`: "Includes: Rope light drive, Aircutton, Frezzer buzzarrr"
+     - `unit_price`: 4500.0
+     - `quantity`: 1
+3. **Priced Line Items:** If individual items have their own prices (e.g., `Item A - 200`, `Item B - 300`), parse them as separate items normally.
 
 Return this exact JSON structure:
 {{
-  "customer_name": "Store Name",
+  "customer_name": "KFC Beach Road K871",
   "is_interstate": false,
-  "email": "email@example.com or empty string",
+  "email": "",
   "notes": "",
   "items": [
     {{
-      "name": "Item Name",
+      "name": "Electrical & Maintenance Supplies",
       "quantity": 1,
-      "unit_price": 0.0,
+      "unit_price": 4500.0,
       "hsn_or_sac": "85480000",
       "is_service": false,
-      "description": ""
+      "description": "Includes: Rope light drive, Aircutton, Frezzer buzzarrr"
     }}
   ]
 }}
 
-ONLY return valid JSON. Nothing else."""
+ONLY return valid JSON."""
 
     try:
-        # Call AI with automatic Groq -> Gemini fallback
-        raw = call_ai_with_fallback(prompt, max_tokens=2000)
+        raw = call_ai_with_fallback(prompt, max_tokens=2500)
 
-        # Strip markdown fences
         if '```' in raw:
             parts = raw.split('```')
             raw = parts[1] if len(parts) > 1 else parts[0]
@@ -264,31 +268,42 @@ ONLY return valid JSON. Nothing else."""
                 raw = raw[4:]
             raw = raw.strip()
 
-        # Isolate JSON object boundaries
         if '{' in raw and '}' in raw:
             start = raw.find('{')
             end = raw.rfind('}') + 1
             raw = raw[start:end]
 
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            import re
-            fixed = raw
-            fixed = re.sub(r"'([^']*)'\s*:", r'"\1":', fixed)
-            fixed = re.sub(r':\s*\'([^\']*)\'', r': "\1"', fixed)
-            fixed = re.sub(r',\s*([\]}])', r'\1', fixed)
-            try:
-                return json.loads(fixed)
-            except Exception:
-                pass  # Fall through to python regex extractor below
+        parsed = json.loads(raw)
 
-    except Exception:
-        pass  # Fall through to python fallback
+        # ── Python Filtering Pass (Safety Net) ───────────────────────────────
+        if 'items' in parsed and isinstance(parsed['items'], list):
+            valid_items = []
+            for item in parsed['items']:
+                name = str(item.get('name', '')).strip()
+                unit = float(item.get('unit_price', 0))
+                
+                # Filter out store header leakage or 0-rate items if grouped
+                is_store_line = any(b in name.upper() for b in ['KFC', 'PHD', 'PARADISE', 'COSTA', 'VAANGO', 'STORE', 'BEACH ROAD'])
+                if is_store_line or unit <= 0:
+                    continue
 
-    # ── ULTIMATE PYTHON FALLBACK ──────────────────────────────────────────────
-    # If the AI ever fails or returns broken JSON, this parses lines locally 
-    # ensuring your quote is ALWAYS created successfully without errors.
+                valid_items.append({
+                    "name": name,
+                    "quantity": float(item.get('quantity', 1)),
+                    "unit_price": unit,
+                    "hsn_or_sac": item.get('hsn_or_sac', '85480000'),
+                    "is_service": bool(item.get('is_service', False)),
+                    "description": item.get('description', '')
+                })
+            parsed['items'] = valid_items
+
+        if parsed.get('items'):
+            return parsed
+
+    except Exception as e:
+        print(f"Gemini parse error: {e}")
+
+    # ── PYTHON FALLBACK ──────────────────────────────────────────────────────
     import re
     lines = message.split('\n')
     extracted_items = []
@@ -302,26 +317,35 @@ ONLY return valid JSON. Nothing else."""
         if '@' in line:
             cust_email = line
             continue
-        if 'store' in line.lower() or 'kfc' in line.lower() or 'phd' in line.lower():
-            cust_name = line.replace('store-', '').replace('Store:', '').strip()
+        if any(k in line.lower() for k in ['store', 'kfc', 'phd', 'paradise', 'vaango', 'costa', 'beach road']):
+            cust_name = line.replace('Store name :-', '').replace('Store code', '').strip()
             continue
-            
-        # Try matching item name and price (e.g., "PVC Elbow 1 inch-150" or "Pillar Cock-850")
-        match = re.search(r'^(.*?)[-\s]+(\d+(?:\.\d+)?)$', line)
+
+        # Look for patterns like "Name - Qty * Price = Total" or "Name - Price"
+        match = re.search(r'^\d*[\.\-\)]?\s*(.*?)(?:[\-\:]\s*|\s+)(\d+(?:\.\d+)?)\s*(?:nos?|pcs?)?\s*[\*xX]\s*(\d+(?:\.\d+)?)(?:\s*=.*)?$', line, re.IGNORECASE)
         if match:
             item_name = match.group(1).strip()
-            price = float(match.group(2))
+            qty = float(match.group(2))
+            total_or_unit = float(match.group(3))
             extracted_items.append({
-                "name": item_name,
-                "quantity": 1.0,
-                "unit_price": price,
-                "hsn_or_sac": "85480000",
-                "is_service": False,
-                "description": ""
+                "name": item_name, "quantity": qty, "unit_price": total_or_unit,
+                "hsn_or_sac": "85480000", "is_service": False, "description": ""
             })
+            continue
+
+        # Simple pattern: Name - Price
+        match_simple = re.search(r'^\d*[\.\-\)]?\s*(.*?)[-\s]+(\d+(?:\.\d+)?)(?:\/-)?$', line)
+        if match_simple:
+            item_name = match_simple.group(1).strip()
+            price = float(match_simple.group(2))
+            if len(item_name) > 2 and not any(b in item_name.upper() for b in ['KFC', 'STORE']):
+                extracted_items.append({
+                    "name": item_name, "quantity": 1.0, "unit_price": price,
+                    "hsn_or_sac": "85480000", "is_service": False, "description": ""
+                })
 
     if not extracted_items:
-        raise Exception("Could not parse items. Please check the message format.")
+        raise Exception("Could not parse items from message format. Please check the text layout.")
 
     return {
         "customer_name": cust_name,
@@ -379,10 +403,10 @@ def extract_store_code(text):
 
 def find_customer(name, raw_message=None):
     """
-    Find customer with zero blind guessing:
-    1. Exact store code match (e.g., K647, S11R29).
-    2. Strict location keyword word-match within the correct brand.
-    3. Fails safely to 'Customer Not Found' if ambiguous — never rolls dice.
+    Find customer with strict locality and town priority:
+    1. Direct Store Code Match (e.g., K948, K567).
+    2. High-weight Town/Area Keyword Matching within the correct brand.
+    3. Fails safely if zero core tokens match — no blind AI guessing.
     """
     all_contacts = fetch_all_customers()
     if not all_contacts:
@@ -390,15 +414,14 @@ def find_customer(name, raw_message=None):
 
     search_text = f"{name} {raw_message or ''}".upper()
 
-    # ── Step 1: Store Code Direct Match (Highest Priority) ───────────────────
+    # ── Step 1: Store Code Direct Match ───────────────────────────────────────
     store_code = extract_store_code(search_text)
     if not store_code and raw_message:
         store_code = extract_store_code(raw_message)
-    
+
     if store_code:
         for c in all_contacts:
             cname = c.get('contact_name', '').upper()
-            # Match code strictly if it is part of the contact name (e.g. ending or hyphenated)
             if f"-{store_code}" in cname or cname.endswith(store_code) or f"{store_code}-" in cname:
                 return c
 
@@ -420,9 +443,9 @@ def find_customer(name, raw_message=None):
         brand = BRAND_PREFIXES.get(prefix)
 
     if not brand:
-        return None  # Cannot determine brand safely — abort to prevent wrong match
+        return None
 
-    # Filter contacts strictly by the identified brand pool
+    # Filter contacts strictly by the identified brand
     if brand == 'KFC':
         filtered = [c for c in all_contacts if 'KFC' in c.get('contact_name', '').upper()]
     elif brand == 'PHD':
@@ -439,25 +462,41 @@ def find_customer(name, raw_message=None):
     if not filtered:
         return None
 
-    # ── Step 3: Exact Location Word Matching (Zero AI Guessing) ──────────────
-    # Extract significant words from input, ignoring common filler terms
-    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND', 'GF', 'FF', 'RD'}
+    # ── Step 3: High-Priority Locality & Town Matching ────────────────────────
+    # Absolute generic stop words that should never drive a match by themselves
+    stop_words = {'STORE', 'KFC', 'PHD', 'COSTA', 'VAANGO', 'PARADISE', 'HYD', 'TELANGANA', 'ANDHRA', 'PRADESH', 'THE', 'AND', 'PLEASE', 'SEND', 'QUOTATION', 'GF', 'FF', 'RD', 'ROAD', 'KA'}
+    
     clean_search = search_text.replace('-', ' ').replace('_', ' ')
-    input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 3]
+    input_words = [w for w in clean_search.split() if w not in stop_words and len(w) > 2]
 
-    # Look for an exact location match inside the filtered brand contacts
+    best_match = None
+    max_score = 0
+
     for c in filtered:
         cname = c.get('contact_name', '').upper()
-        cname_parts = cname.replace('-', ' ').replace('_', ' ').split()
-        
-        # Check if any significant input word matches a distinct word in the Zoho contact name
-        if any(word in cname_parts for word in input_words):
-            return c
+        cname_clean = cname.replace('-', ' ').replace('_', ' ')
+        cname_tokens = cname_clean.split()
 
-    # ── Step 4: Absolute Safety Shutoff ──────────────────────────────────────
-    # If a store cannot be matched with 100% safety, return None. 
-    # This immediately triggers the clean "Customer Not Found" warning box 
-    # instead of ever generating a quote for the wrong store.
+        score = 0
+        for word in input_words:
+            # If the specific town/locality name (like NARSARAOPET, KOMPALLY, KOTHAGUDA) 
+            # matches a token in the store name, give it massive weight (5 points).
+            if word in cname_tokens:
+                if word in ['MALL', 'KASU', 'CENTRAL', 'CITY']:
+                    score += 1  # Modifiers get low weight
+                else:
+                    score += 5  # Primary town/locality names get high weight
+            elif any(word in tok for tok in cname_tokens):
+                score += 2
+
+        if score > max_score:
+            max_score = score
+            best_match = c
+
+    # Require a strong score threshold (meaning the core town name matched)
+    if best_match and max_score >= 5:
+        return best_match
+
     return None
 
 def match_all_items(item_names):
@@ -520,10 +559,14 @@ Reply ONLY with a valid JSON array, one entry per input item, in order:
 
 
 def create_item(name, hsn_code, rate, tax_id, is_service=False):
-    # Fallback to your preferred default if HSN is blank or 999`
+    # Ensure clean 8-digit HSN or 6-digit SAC
     clean_hsn = str(hsn_code).strip()
+    if len(clean_hsn) == 7 and clean_hsn.isdigit():
+        clean_hsn += '0'
+        
+    # Updated sensible defaults instead of 99999999
     if not clean_hsn or clean_hsn in ['99999999', '9999999', '']:
-        clean_hsn = '99545900' # Standard 8-digit fallback for general goods/materials
+        clean_hsn = '99545900' if is_service else '83024900'
 
     payload = {
         "name": name, "rate": rate,
@@ -540,30 +583,38 @@ def create_item(name, hsn_code, rate, tax_id, is_service=False):
     item = resp.get('item', {})
 
     if not item:
-        # Item already exists — fetch it and check its HSN
-        if resp.get('code') == 1001 and 'already exists' in resp.get('message', ''):
+        if resp.get('code') == 1001 or 'already exists' in str(resp).lower():
             r2       = zh_get('/items', {'search_text': name})
             existing = r2.json().get('items', [])
             if existing:
                 ex_item = existing[0]
                 ex_hsn  = ex_item.get('hsn_or_sac', '').strip()
                 
-                # FORCE UPDATE: If existing item has a blank, 0, or default 99999999 HSN, update it!
-                if not ex_hsn or ex_hsn in ['99999999', '9999999'] or '0000' in ex_hsn:
+                # SELF-HEAL: Overwrite old dummy HSNs with the proper default
+                if not ex_hsn or ex_hsn in ['99999999', '9999999'] or len(ex_hsn) < 8 or '0000' in ex_hsn:
                     upd_payload = {
                         "name":         ex_item.get('name', name),
                         "rate":         ex_item.get('rate', rate),
                         "hsn_or_sac":   clean_hsn,
                         "product_type": "service" if is_service else "goods"
                     }
+                    if tax_id:
+                        upd_payload["tax_id"] = tax_id
                     zh_put(f'/items/{ex_item["item_id"]}', upd_payload)
                     ex_item['hsn_or_sac'] = clean_hsn
                 return ex_item
         raise Exception(f"Item creation failed: {resp}")
     return item
 
+
 # ── Local HSN/SAC keyword lookup — no tokens, instant ────────────────────────
 HSN_KEYWORDS = [
+    # HVAC, Compressors & Refrigeration
+    (['compressor', 'zr61', 'scroll compressor'],                                  ('84143090', False)),
+    (['refrigerant', 'r-22', 'r22', 'r-410', 'gas r'],                            ('29033990', False)),
+    (['fan motor', 'odu motor', 'idu motor', 'blower motor'],                    ('85011019', False)),
+    (['water service', 'general service', 'jet cleaning', 'service'],            ('998719', True)),
+    (['pressure test', 'nitrogen test', 'leak test'],                            ('998719', True)),
     # Tools & Hardware
     (['wrench', 'spanner', 'pipe wrench'],                                      ('82041110', False)),
     (['screwdriver', 'screw driver'],                                            ('82054000', False)),
@@ -740,7 +791,7 @@ Nothing else."""
     # Final safety fallback for any items that completely failed lookup
     for i, _ in enumerate(items):
         if i not in result:
-            result[i] = {'hsn_or_sac': '85480000', 'is_service': False}
+            result[i] = {'hsn_or_sac': '83024900', 'is_service': False}
 
     return result
     
@@ -1006,7 +1057,6 @@ def process():
             qty          = float(item.get('quantity', 1))
             unit_price   = float(item.get('unit_price', 0))
             
-            # Use local HSN lookup result first, fallback to item parsed value
             hsn_info     = hsn_map_qb.get(idx, {})
             hsn          = hsn_info.get('hsn_or_sac', item.get('hsn_or_sac', item.get('hsn_code', '')))
             is_service   = hsn_info.get('is_service', item.get('is_service', False))
@@ -1016,6 +1066,17 @@ def process():
             
             if existing:
                 item_id = existing['item_id']
+                ex_hsn  = existing.get('hsn_or_sac', '').strip()
+                # SELF-HEAL: If matched Zoho item has a bad/dummy HSN, update it on the fly!
+                if not ex_hsn or ex_hsn in ['99999999', '9999999'] or len(ex_hsn) < 8:
+                    if not hsn or hsn in ['99999999', '9999999']:
+                        hsn = '99545900' if is_service else '85480000'
+                    zh_put(f'/items/{item_id}', {
+                        "name": existing.get('name', name),
+                        "rate": marked_price,
+                        "hsn_or_sac": hsn,
+                        "product_type": "service" if is_service else "goods"
+                    })
             else:
                 created = create_item(name, hsn, marked_price, tax_id, is_service)
                 item_id = created.get('item_id', '')
@@ -2014,18 +2075,26 @@ def quoteform_generate():
             if not name or unit_price <= 0:
                 continue
 
-            # Apply 10% markup (or match your QuoteForm standard markup)
             marked_price = round(unit_price * 1.10, 2)
 
-            # Get HSN/SAC from the unified local + AI detector
             hsn_info   = hsn_map.get(idx, {})
             hsn_code   = hsn_info.get('hsn_or_sac', '99545900')
             is_service = hsn_info.get('is_service', False)
 
-            # Use matched Zoho item or create new one with the correct HSN
             existing = item_match_map.get(idx)
             if existing:
                 item_id = existing['item_id']
+                ex_hsn  = existing.get('hsn_or_sac', '').strip()
+                # SELF-HEAL: Update bad HSN on existing matched item
+                if not ex_hsn or ex_hsn in ['99999999', '9999999'] or len(ex_hsn) < 8:
+                    if not hsn_code or hsn_code in ['99999999', '9999999']:
+                        hsn_code = '99545900' if is_service else '85480000'
+                    zh_put(f'/items/{item_id}', {
+                        "name": existing.get('name', name),
+                        "rate": marked_price,
+                        "hsn_or_sac": hsn_code,
+                        "product_type": "service" if is_service else "goods"
+                    })
             else:
                 created  = create_item(name, hsn_code, marked_price, tax_id, is_service=is_service)
                 item_id  = created.get('item_id', '')
